@@ -55,6 +55,81 @@ def a_protobuf(datos: dict) -> tuple[bytes, int, set[str]]:
     return msg.SerializeToString(), n, alumnos
 
 
+# --------------------------------------------------------------------------- telemetría nativa de Claude Code
+
+TIPO_NATIVO = {
+    "claude_code.interaction": "AGENT",
+    "claude_code.llm_request": "LLM",
+    "claude_code.tool": "TOOL",
+}
+
+
+def _attrs(lista: list) -> dict:
+    out = {}
+    for a in lista or []:
+        v = a.get("value", {})
+        out[a.get("key")] = next(iter(v.values()), None) if v else None
+    return out
+
+
+def _attr(clave, valor) -> dict:
+    if isinstance(valor, int) and not isinstance(valor, bool):
+        return {"key": clave, "value": {"intValue": str(valor)}}
+    return {"key": clave, "value": {"stringValue": str(valor)}}
+
+
+def enriquecer_nativo(datos: dict, proyecto_defecto: str = "taller-otel") -> None:
+    """Añade atributos OpenInference a los spans de la telemetría nativa de Claude Code (claude_code.*).
+
+    Así Phoenix los muestra como turnos (AGENT), llamadas al modelo (LLM) y herramientas (TOOL), con
+    entrada, salida, tokens, alumno y sesión. Los spans del plugin no se tocan.
+    """
+    for rs in datos.get("resourceSpans", []):
+        res = rs.setdefault("resource", {}).setdefault("attributes", [])
+        ra = _attrs(res)
+        if "openinference.project.name" not in ra:
+            res.append(_attr("openinference.project.name", proyecto_defecto))
+        alumno = ra.get("taller.alumno") or ra.get("user.email") or ""
+        for ss in rs.get("scopeSpans", []):
+            for s in ss.get("spans", []):
+                tipo = TIPO_NATIVO.get(s.get("name", ""))
+                a = _attrs(s.get("attributes"))
+                if not s.get("name", "").startswith("claude_code.") or "openinference.span.kind" in a:
+                    continue
+                nuevos = [_attr("openinference.span.kind", tipo or "CHAIN")]
+                if alumno:
+                    nuevos.append(_attr("user.id", alumno))
+                if s["name"] == "claude_code.interaction":
+                    if a.get("user_prompt"):
+                        nuevos.append(_attr("input.value", a["user_prompt"]))
+                elif s["name"] == "claude_code.llm_request":
+                    ent = sum(int(a.get(k) or 0) for k in ("input_tokens", "cache_read_tokens", "cache_creation_tokens"))
+                    sal = int(a.get("output_tokens") or 0)
+                    nuevos += [_attr("llm.model_name", a.get("model", "")), _attr("llm.provider", "anthropic"),
+                               _attr("llm.token_count.prompt", ent), _attr("llm.token_count.completion", sal),
+                               _attr("llm.token_count.total", ent + sal)]
+                elif s["name"] == "claude_code.tool":
+                    nuevos.append(_attr("tool.name", a.get("tool_name", "")))
+                    entrada = a.get("full_command") or a.get("file_path") or a.get("subagent_type") or ""
+                    if entrada:
+                        nuevos.append(_attr("input.value", entrada))
+                    for e in s.get("events", []):
+                        if e.get("name") == "tool.output":
+                            ea = _attrs(e.get("attributes"))
+                            salida = ea.get("output") or ea.get("content") or ea.get("diff")
+                            if salida:
+                                nuevos.append(_attr("output.value", str(salida)[:30000]))
+                if tipo is None:
+                    nuevos[0] = _attr("openinference.span.kind", "CHAIN")
+                s.setdefault("attributes", []).extend(nuevos)
+
+
+def guardar_jsonl(nombre: str, datos: dict) -> None:
+    ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", nombre)
+    with open(ruta, "a", encoding="utf-8") as f:
+        f.write(json.dumps(datos, ensure_ascii=False) + "\n")
+
+
 def log(*partes) -> None:
     print(time.strftime("%H:%M:%S"), *partes, flush=True)
 
@@ -81,7 +156,7 @@ class Manejador(BaseHTTPRequestHandler):
 
     def do_POST(self):
         origen = self.headers.get("X-Forwarded-For", self.client_address[0])
-        if self.path != "/v1/traces":
+        if self.path not in ("/v1/traces", "/v1/logs", "/v1/metrics"):
             return self.responder(404, "no encontrado")
         auth = self.headers.get("Authorization", "")
         if not TOKEN or not hmac.compare_digest(auth.encode(), f"Bearer {TOKEN}".encode()):
@@ -90,8 +165,19 @@ class Manejador(BaseHTTPRequestHandler):
         largo = int(self.headers.get("Content-Length", "0") or 0)
         if largo <= 0 or largo > MAX_CUERPO:
             return self.responder(413, "cuerpo vacío o demasiado grande")
+        if self.path in ("/v1/logs", "/v1/metrics"):
+            # Telemetría nativa: eventos y métricas se guardan tal cual para consultarlos después.
+            try:
+                datos = json.loads(self.rfile.read(largo))
+                guardar_jsonl("otel-logs.jsonl" if self.path == "/v1/logs" else "otel-metrics.jsonl", datos)
+            except Exception as e:
+                log("400", origen, self.path, type(e).__name__)
+                return self.responder(400, "OTLP JSON no válido")
+            log(200, self.path, origen)
+            return self.responder(200, "{}")
         try:
             datos = json.loads(self.rfile.read(largo))
+            enriquecer_nativo(datos)
             pb, n, alumnos = a_protobuf(datos)
         except Exception as e:
             log("400", origen, type(e).__name__, str(e)[:200])
