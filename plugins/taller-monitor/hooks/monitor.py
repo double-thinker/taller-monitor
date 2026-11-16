@@ -9,9 +9,9 @@ Si el envío falla, el evento se guarda como un fichero suelto en la carpeta `co
 de datos del plugin y se reintenta en el siguiente evento. Nunca bloquea ni cambia el comportamiento
 de Claude Code: ante cualquier error termina con código 0 y sin salida.
 
-Configuración. Gana la variable de entorno, después la opción del plugin y después el fichero
-.claude/taller-monitor.json del repositorio ({"url": ..., "token": ..., "proyecto": ...}). El nombre
-del alumno puede ir en .claude/taller-monitor.local.json ({"alumno": ...}), que no se sube a git:
+Configuración. Gana la variable de entorno, después el fichero .claude/taller-monitor.json del
+repositorio ({"url": ..., "token": ..., "proyecto": ...}) junto con
+.claude/taller-monitor.local.json ({"alumno": ...}, no se sube a git) y por último la opción del plugin:
   TALLER_MONITOR_URL       o la opción "url"      URL base del receptor; varias separadas por comas
                                                   (se usa la siguiente si la primera no responde)
   TALLER_MONITOR_TOKEN     o la opción "token"    token que da el profesor
@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 MAX_TEXTO = 30_000  # caracteres por campo de texto
 MAX_TRANSCRIPT = 4_000_000  # bytes leídos como máximo del final de un transcript
 MAX_COLA = 500  # eventos pendientes como máximo
@@ -55,12 +55,14 @@ def config_repo() -> dict:
 
 
 def opcion(nombre: str, defecto: str = "", repo: dict | None = None) -> str:
+    # La opción del plugin se guarda en el ~/.claude/settings.json del usuario y sirve para todos sus
+    # repositorios, así que el fichero del repositorio gana a la opción.
     v = os.environ.get(f"TALLER_MONITOR_{nombre.upper()}", "").strip()
-    if not v:
-        v = os.environ.get(f"CLAUDE_PLUGIN_OPTION_{nombre.upper()}", "").strip()
     if not v and repo:
         r = repo.get(nombre, "")
         v = (",".join(r) if isinstance(r, list) else str(r or "")).strip()
+    if not v:
+        v = os.environ.get(f"CLAUDE_PLUGIN_OPTION_{nombre.upper()}", "").strip()
     return v or defecto
 
 

@@ -46,6 +46,18 @@ class Base(unittest.TestCase):
 # ------------------------------------------------------------------- cliente
 
 class TestConfig(Base):
+    def test_fichero_del_repositorio_gana_a_la_opcion_global(self):
+        # La opción del plugin vive en ~/.claude/settings.json: una instalación anterior no debe
+        # cambiar el nombre que el alumno ha elegido en este repositorio.
+        repo = Path(self.tmp.name) / "repo"
+        (repo / ".claude").mkdir(parents=True)
+        (repo / ".claude" / "taller-monitor.json").write_text(json.dumps({"url": "https://m", "token": "k"}))
+        (repo / ".claude" / "taller-monitor.local.json").write_text(json.dumps({"alumno": "javi"}))
+        os.environ.update(CLAUDE_PROJECT_DIR=str(repo), CLAUDE_PLUGIN_OPTION_ALUMNO="javier")
+        self.assertEqual(monitor.config()["alumno"], "javi")
+        os.environ["TALLER_MONITOR_ALUMNO"] = "otro"
+        self.assertEqual(monitor.config()["alumno"], "otro")
+
     def test_sin_url_no_hace_nada(self):
         os.environ["CLAUDE_PROJECT_DIR"] = self.tmp.name
         self.assertIsNone(monitor.config())
