@@ -4,10 +4,11 @@
 Solo usa la biblioteca estándar. Nunca bloquea ni cambia el comportamiento de Claude Code:
 ante cualquier error, termina con código 0 y sin salida.
 
-Configuración (la variable de entorno gana a la opción del plugin):
+Configuración. Gana la variable de entorno, después la opción del plugin y después el fichero
+.claude/taller-monitor.json del repositorio ({"url": ..., "token": ..., "proyecto": ...}):
   TALLER_MONITOR_URL       o la opción "url"      URL base del receptor, p. ej. https://equipo.ts.net:10000
   TALLER_MONITOR_TOKEN     o la opción "token"    token que da el profesor
-  TALLER_MONITOR_ALUMNO    o la opción "alumno"   nombre visible en el panel (por defecto, el usuario del sistema)
+  TALLER_MONITOR_ALUMNO    o la opción "alumno"   nombre visible en el panel (por defecto, el correo de git sin dominio)
   TALLER_MONITOR_PROYECTO  o la opción "proyecto" proyecto de Phoenix (por defecto, "taller")
   TALLER_MONITOR_OFF=1     desactiva el envío sin desinstalar el plugin
 """
@@ -30,28 +31,54 @@ TIMEOUT = 5  # segundos por envío
 
 # --------------------------------------------------------------------------- configuración
 
-def opcion(nombre: str, defecto: str = "") -> str:
+def config_repo() -> dict:
+    """Configuración del repositorio del taller: .claude/taller-monitor.json en la raíz del proyecto."""
+    base = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    try:
+        return json.loads((Path(base) / ".claude" / "taller-monitor.json").read_text())
+    except Exception:
+        return {}
+
+
+def opcion(nombre: str, defecto: str = "", repo: dict | None = None) -> str:
+    """Prioridad: variable TALLER_MONITOR_*, opción del plugin, fichero del repositorio, valor por defecto."""
     v = os.environ.get(f"TALLER_MONITOR_{nombre.upper()}", "").strip()
     if not v:
         v = os.environ.get(f"CLAUDE_PLUGIN_OPTION_{nombre.upper()}", "").strip()
+    if not v and repo:
+        v = str(repo.get(nombre, "") or "").strip()
     return v or defecto
+
+
+def alumno_por_defecto() -> str:
+    """El correo o el nombre de git del alumno; si no hay, el usuario del sistema."""
+    import subprocess
+
+    for clave in ("user.email", "user.name"):
+        try:
+            v = subprocess.run(["git", "config", clave], capture_output=True, text=True, timeout=2).stdout.strip()
+            if v:
+                return v.split("@")[0] if clave == "user.email" else v
+        except Exception:
+            pass
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "anonimo"
 
 
 def config() -> dict | None:
     if os.environ.get("TALLER_MONITOR_OFF", "") in ("1", "true", "si", "sí"):
         return None
-    url, token = opcion("url"), opcion("token")
+    repo = config_repo()
+    url, token = opcion("url", repo=repo), opcion("token", repo=repo)
     if not url or not token:
         return None
-    try:
-        usuario = getpass.getuser()
-    except Exception:
-        usuario = "anonimo"
     return {
         "url": url.rstrip("/") + "/v1/traces",
         "token": token,
-        "alumno": opcion("alumno", usuario),
-        "proyecto": opcion("proyecto", "taller"),
+        "alumno": opcion("alumno", repo=repo) or alumno_por_defecto(),
+        "proyecto": opcion("proyecto", "taller", repo=repo),
     }
 
 

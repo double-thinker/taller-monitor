@@ -71,6 +71,17 @@ class TestConfig(Base):
                           TALLER_MONITOR_URL="https://b")
         self.assertEqual(monitor.config()["url"], "https://b/v1/traces")
 
+    def test_fichero_del_repositorio(self):
+        repo = Path(self.tmp.name) / "repo"
+        (repo / ".claude").mkdir(parents=True)
+        (repo / ".claude" / "taller-monitor.json").write_text(
+            json.dumps({"url": "https://monitor.example", "token": "k", "proyecto": "taller-x"}))
+        os.environ.update(CLAUDE_PROJECT_DIR=str(repo), TALLER_MONITOR_ALUMNO="eva")
+        c = monitor.config()
+        self.assertEqual(c["url"], "https://monitor.example/v1/traces")
+        self.assertEqual(c["proyecto"], "taller-x")
+        self.assertEqual(c["alumno"], "eva")
+
     def test_off(self):
         os.environ.update(TALLER_MONITOR_URL="https://b", TALLER_MONITOR_TOKEN="k", TALLER_MONITOR_OFF="1")
         self.assertIsNone(monitor.config())

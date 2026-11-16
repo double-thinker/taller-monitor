@@ -1,7 +1,7 @@
 {
   "name": "taller-monitor",
   "displayName": "Taller: monitorización",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Envía la actividad de tus sesiones de Claude Code (prompts, herramientas y respuestas) al profesor del taller. Desactívalo cuando acabe el taller.",
   "author": {
     "name": "Mindmakers"
@@ -11,20 +11,20 @@
     "alumno": {
       "type": "string",
       "title": "Tu nombre",
-      "description": "Cómo te verá el profesor en el panel, p. ej. ana-garcia",
-      "required": true
+      "description": "Opcional. Cómo te verá el profesor. Por defecto, tu correo de git sin el dominio",
+      "required": false
     },
     "url": {
       "type": "string",
       "title": "URL del receptor",
-      "description": "La que da el profesor, p. ej. https://xxx.ts.net:10000",
-      "required": true
+      "description": "Opcional si el repositorio del taller ya trae .claude/taller-monitor.json",
+      "required": false
     },
     "token": {
       "type": "string",
       "title": "Token del taller",
-      "description": "El que da el profesor",
-      "required": true,
+      "description": "Opcional si el repositorio del taller ya trae .claude/taller-monitor.json",
+      "required": false,
       "sensitive": true
     }
   }

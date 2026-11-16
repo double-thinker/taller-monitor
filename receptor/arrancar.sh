@@ -2,7 +2,7 @@
 # Arranca Phoenix (solo local), el receptor y la exposición pública.
 #
 # Variables (todas opcionales):
-#   TALLER_EXPONER        tailscale (por defecto) | cloudflare-rapido | cloudflare | ninguno
+#   TALLER_EXPONER        tailscale (por defecto) | cloudflare | ninguno
 #   CLOUDFLARE_TUNNEL_TOKEN, TALLER_URL_PUBLICA   solo con TALLER_EXPONER=cloudflare
 #   TALLER_FUNNEL_PUERTO  puerto público de Tailscale Funnel: 443, 8443 o 10000 (por defecto 10000)
 #   RECEPTOR_PUERTO       puerto local del receptor (por defecto 6010)
@@ -59,28 +59,20 @@ case "$EXPONER" in
       echo "$SALIDA"
       echo
       echo "Tailscale Funnel no está autorizado para este equipo. Abre el enlace de arriba, autorízalo y vuelve a ejecutar ./arrancar.sh."
-      echo "O usa otra salida: TALLER_EXPONER=cloudflare-rapido ./arrancar.sh"
+      echo "O usa la alternativa con dominio propio: TALLER_EXPONER=cloudflare ./arrancar.sh"
       exit 1
     fi
     NOMBRE="$(tailscale status --json | .venv/bin/python -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
     URL_PUBLICA="https://${NOMBRE}"
     [ "$FUNNEL" = "443" ] || URL_PUBLICA="${URL_PUBLICA}:${FUNNEL}"
     ;;
-  cloudflare-rapido)
-    # Túnel temporal de Cloudflare, sin cuenta: la URL cambia cada vez que se arranca.
-    if ! vivo data/cloudflared.pid; then
-      : > data/cloudflared.log
-      nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:${RECEPTOR_PUERTO}" >> data/cloudflared.log 2>&1 &
-      echo $! > data/cloudflared.pid
-    fi
-    for _ in $(seq 1 30); do grep -qo 'https://[a-z0-9-]*\.trycloudflare\.com' data/cloudflared.log && break; sleep 1; done
-    URL_PUBLICA="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' data/cloudflared.log | head -1)"
-    [ -n "$URL_PUBLICA" ] || { echo "cloudflared no dio URL: mira receptor/data/cloudflared.log"; exit 1; }
-    ;;
   cloudflare)
     # Túnel con nombre propio (p. ej. monitor.midominio.com). Se crea en el panel de Cloudflare
     # apuntando a http://127.0.0.1:${RECEPTOR_PUERTO}; aquí solo se arranca con su token.
-    : "${CLOUDFLARE_TUNNEL_TOKEN:?Falta CLOUDFLARE_TUNNEL_TOKEN}" "${TALLER_URL_PUBLICA:?Falta TALLER_URL_PUBLICA}"
+    # El token del túnel puede venir en la variable o en data/cloudflare-tunnel-token, y la URL en data/cloudflare-url.
+    [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ] || CLOUDFLARE_TUNNEL_TOKEN="$(cat data/cloudflare-tunnel-token 2>/dev/null || true)"
+    [ -n "${TALLER_URL_PUBLICA:-}" ] || TALLER_URL_PUBLICA="$(cat data/cloudflare-url 2>/dev/null || true)"
+    : "${CLOUDFLARE_TUNNEL_TOKEN:?Falta CLOUDFLARE_TUNNEL_TOKEN o data/cloudflare-tunnel-token}" "${TALLER_URL_PUBLICA:?Falta TALLER_URL_PUBLICA o data/cloudflare-url}"
     if ! vivo data/cloudflared.pid; then
       TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" nohup cloudflared tunnel --no-autoupdate run >> data/cloudflared.log 2>&1 &
       echo $! > data/cloudflared.pid
