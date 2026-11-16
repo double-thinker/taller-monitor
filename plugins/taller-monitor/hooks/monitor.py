@@ -216,12 +216,19 @@ def enviar(cfg, spans: list[dict]) -> None:
                 cfg["url"],
                 data=cuerpo.encode("utf-8"),
                 method="POST",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {cfg['token']}"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {cfg['token']}",
+                    # Cloudflare rechaza el agente por defecto de Python (error 1010).
+                    "User-Agent": "taller-monitor/1.1",
+                },
             )
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 if r.status >= 300:
                     fallidos.append(cuerpo)
         except urllib.error.HTTPError as e:
+            if os.environ.get("TALLER_MONITOR_DEBUG"):
+                print(f"taller-monitor: HTTP {e.code} {e.read()[:200]!r}", file=sys.stderr)
             if e.code >= 500 or e.code == 429:
                 fallidos.append(cuerpo)
             # 401/403/413: no se reintenta
