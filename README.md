@@ -20,26 +20,28 @@ El repositorio es un marketplace de Claude Code con dos plugins:
 
 Requisitos: Claude Code y `python3` en el `PATH` (el plugin solo usa la biblioteca estándar).
 
+El plugin se instala solo para el repositorio del taller (`--scope local`), nunca a nivel de usuario. Desde la carpeta del repositorio:
+
 ```bash
 claude plugin marketplace add double-thinker/taller-monitor
-claude plugin install taller-monitor@taller-monitor \
-  --config alumno=TU-NOMBRE \
-  --config url=URL-DEL-PROFESOR \
-  --config token=TOKEN-DEL-PROFESOR
+claude plugin install taller-monitor@taller-monitor --scope local
 ```
 
-Si instalas sin `--config`, Claude Code te pide los tres valores con `/plugin configure taller-monitor@taller-monitor`.
+La configuración sale de ficheros del propio repositorio:
 
-También se puede configurar con variables de entorno, que tienen prioridad sobre la configuración del plugin: `TALLER_MONITOR_URL`, `TALLER_MONITOR_TOKEN`, `TALLER_MONITOR_ALUMNO` y `TALLER_MONITOR_PROYECTO`.
+- `.claude/taller-monitor.json` (versionado): `url` (una URL o una lista, se prueban en orden), `token` y `proyecto`.
+- `.claude/taller-monitor.local.json` (en `.gitignore`): `{"alumno": "ana-garcia"}`.
+
+Las variables de entorno tienen prioridad: `TALLER_MONITOR_URL`, `TALLER_MONITOR_TOKEN`, `TALLER_MONITOR_ALUMNO` y `TALLER_MONITOR_PROYECTO`. En el taller, el alumno no hace nada de esto a mano: abre Claude Code en el repositorio y le pide que siga `INICIO.md`.
 
 Para dejar de enviar:
 
 ```bash
-claude plugin uninstall taller-monitor@taller-monitor     # al acabar el taller
-export TALLER_MONITOR_OFF=1                                # pausa, sin desinstalar
+claude plugin uninstall taller-monitor@taller-monitor --scope local   # al acabar el taller
+export TALLER_MONITOR_OFF=1                                           # pausa, sin desinstalar
 ```
 
-**Qué se envía:** el texto de tus prompts, las respuestas de Claude, los comandos que ejecuta, los ficheros que lee o edita (contenido incluido, recortado a 30 000 caracteres por campo), la carpeta en la que trabajas y los tokens. No se envían variables de entorno ni ficheros que Claude no haya tocado. Los datos se quedan en el ordenador del profesor y no se comparten con terceros.
+**Qué se envía:** solo lo que pasa en las sesiones abiertas en ese repositorio: el texto de tus prompts, las respuestas de Claude, los comandos que ejecuta, los ficheros que lee o edita (contenido incluido, recortado a 30 000 caracteres por campo), la carpeta en la que trabajas y los tokens. No se envían variables de entorno ni ficheros que Claude no haya tocado. Los datos se quedan en el ordenador del profesor y no se comparten con terceros.
 
 ## Para el profesor
 
@@ -53,16 +55,15 @@ cd taller-monitor/receptor
 
 El script arranca Phoenix en `127.0.0.1:6006`, el receptor en `127.0.0.1:6010` y la exposición pública. Al final imprime la URL y el token que hay que dar a los alumnos. El token se genera la primera vez y se guarda en `receptor/data/token`.
 
-Exposición, con `TALLER_EXPONER`:
+Exposición, con `TALLER_EXPONER`. En los dos casos la URL es fija:
 
 | Valor | Qué hace |
 |---|---|
-| `tailscale` (por defecto) | `tailscale funnel` en el puerto `TALLER_FUNNEL_PUERTO` (por defecto 10000). El equipo tiene que estar autorizado para Funnel en la política del tailnet; si no lo está, el script imprime el enlace para autorizarlo |
-| `cloudflare-rapido` | Túnel temporal de Cloudflare sin cuenta (`*.trycloudflare.com`). La URL cambia en cada arranque |
-| `cloudflare` | Túnel con nombre propio creado en el panel de Cloudflare apuntando a `http://127.0.0.1:6010`. Necesita `CLOUDFLARE_TUNNEL_TOKEN` y `TALLER_URL_PUBLICA` |
+| `tailscale` (por defecto) | `tailscale funnel` en el puerto `TALLER_FUNNEL_PUERTO` (por defecto 10000): `https://<equipo>.<tailnet>.ts.net:10000`. El equipo tiene que estar autorizado para Funnel en la política del tailnet; si no lo está, el script imprime el enlace para autorizarlo |
+| `cloudflare` | Alternativa con dominio propio (por ejemplo `https://monitor.example.com`): un túnel con nombre de Cloudflare que apunta a `http://127.0.0.1:6010`. Necesita `CLOUDFLARE_TUNNEL_TOKEN` y `TALLER_URL_PUBLICA` (o `data/cloudflare-tunnel-token` y `data/cloudflare-url`) |
 | `ninguno` | Solo local, para pruebas |
 
-Solo el receptor queda expuesto, y solo responde a `GET /salud` y a `POST /v1/traces` con el token. La interfaz, la API y el MCP de Phoenix siguen en `127.0.0.1`.
+Solo el receptor queda expuesto, y todo salvo `GET /salud` pide el token (ver [Endpoints](#endpoints-del-receptor)). La interfaz, la API y el MCP de Phoenix siguen en `127.0.0.1`.
 
 Para parar todo: `./parar.sh`. Los datos quedan en `receptor/data/` (Phoenix usa SQLite).
 
