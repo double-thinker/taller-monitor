@@ -95,6 +95,21 @@ Para parar todo: `./parar.sh`. Los datos quedan en `receptor/data/` (Phoenix usa
   - Telemetría nativa de Claude Code (`OTEL_EXPORTER_OTLP_ENDPOINT` con `http/json`): las trazas se traducen a OpenInference y van al proyecto `taller-otel`; eventos y métricas se guardan en `receptor/data/`.
 - **Agente del profesor**: Phoenix 19 o superior trae un servidor MCP en `/mcp`. El plugin `taller-profesor` lo registra y la skill explica qué significa cada span.
 
+## Endpoints del receptor
+
+Todos piden `Authorization: Bearer <token>` salvo `/salud`.
+
+| Método y ruta | Para qué |
+|---|---|
+| `GET /salud` | Comprobar que el receptor responde |
+| `POST /v1/events` | Eventos de hooks: del plugin (con envoltorio) o de hooks HTTP (el evento tal cual, alumno por `X-Alumno` o por la carpeta inscrita) |
+| `POST /v1/traces`, `/v1/logs`, `/v1/metrics` | Telemetría OTLP en JSON: la del plugin 1.x y la nativa de Claude Code |
+| `POST /v1/registro` | Inscribir a un alumno: `{"alumno", "cwd", "so", "via"}`. La carpeta sirve para reconocer sus sesiones de hooks HTTP |
+| `GET /v1/registro?alumno=<nombre>` | Si está inscrito y si llegan datos suyos (`"recibiendo": true`) |
+| `POST /v1/feedback` | Problemas de instalación que reportan los agentes. Se guardan en `receptor/data/feedback.jsonl` |
+
+El registro se guarda en `receptor/data/registro.json`.
+
 ## Tests
 
 ```bash

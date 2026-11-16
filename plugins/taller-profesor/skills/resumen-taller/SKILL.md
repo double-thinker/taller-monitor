@@ -29,6 +29,7 @@ Cada alumno es un `user.id`. Cada sesión de Claude Code es un `session.id`. Spa
 1. Usa las herramientas del MCP `phoenix`: lista los proyectos, las sesiones y los spans del proyecto. Filtra por ventana de tiempo si el profesor la da (por defecto, la última hora).
 2. Si el MCP no basta, la API REST local sirve igual: `curl -s "http://127.0.0.1:6006/v1/projects/<proyecto>/spans?limit=500"`. Devuelve `data[]` con `name`, `start_time`, `end_time`, `status_code`, `parent_id` y `attributes`.
 3. Agrupa por `user.id` y, dentro, ordena los turnos por hora.
+4. Para saber quién ha instalado la monitorización y quién no, lee `receptor/data/registro.json` del repositorio taller-monitor. Los problemas de instalación que mandan los agentes están en `receptor/data/feedback.jsonl`.
 
 ## Qué contar de cada alumno
 
