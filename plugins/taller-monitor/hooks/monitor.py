@@ -35,7 +35,7 @@ def config_repo() -> dict:
     """Configuración del repositorio del taller: .claude/taller-monitor.json en la raíz del proyecto."""
     base = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     try:
-        return json.loads((Path(base) / ".claude" / "taller-monitor.json").read_text())
+        return json.loads((Path(base) / ".claude" / "taller-monitor.json").read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
@@ -103,7 +103,7 @@ class Estado:
         self.datos: dict = {}
 
     def __enter__(self):
-        self.cerrojo = open(str(self.ruta) + ".lock", "a+")
+        self.cerrojo = open(str(self.ruta) + ".lock", "a+", encoding="utf-8")
         try:
             import fcntl
 
@@ -111,14 +111,14 @@ class Estado:
         except ImportError:  # Windows: sin cerrojo
             pass
         try:
-            self.datos = json.loads(self.ruta.read_text())
+            self.datos = json.loads(self.ruta.read_text(encoding="utf-8"))
         except Exception:
             self.datos = {}
         return self
 
     def __exit__(self, *exc):
         try:
-            self.ruta.write_text(json.dumps(self.datos))
+            self.ruta.write_text(json.dumps(self.datos), encoding="utf-8")
         finally:
             self.cerrojo.close()
 
@@ -204,7 +204,7 @@ def enviar(cfg, spans: list[dict]) -> None:
     cuerpos = []
     if cola.exists():
         try:
-            cuerpos = [l for l in cola.read_text().splitlines() if l.strip()]
+            cuerpos = [l for l in cola.read_text(encoding="utf-8").splitlines() if l.strip()]
             cola.unlink()
         except Exception:
             cuerpos = []
@@ -220,7 +220,7 @@ def enviar(cfg, spans: list[dict]) -> None:
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {cfg['token']}",
                     # Cloudflare rechaza el agente por defecto de Python (error 1010).
-                    "User-Agent": "taller-monitor/1.1",
+                    "User-Agent": "taller-monitor/1.1.2",
                 },
             )
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
@@ -237,7 +237,7 @@ def enviar(cfg, spans: list[dict]) -> None:
     if fallidos:
         datos = "\n".join(fallidos) + "\n"
         if len(datos) <= MAX_PENDIENTES:
-            with open(cola, "a") as f:
+            with open(cola, "a", encoding="utf-8") as f:
                 f.write(datos)
 
 
@@ -465,9 +465,9 @@ def main() -> int:
         cfg = config()
         if cfg is None:
             return 0
-        ev = json.loads(sys.stdin.read() or "{}")
+        ev = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
         if os.environ.get("TALLER_MONITOR_DEBUG"):
-            with open(dir_datos() / "eventos-debug.jsonl", "a") as f:
+            with open(dir_datos() / "eventos-debug.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
         enviar(cfg, procesar(ev, cfg))
     except Exception:
