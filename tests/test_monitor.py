@@ -185,7 +185,7 @@ class TestReconstruccion(Base):
         self.ev("UserPromptSubmit", 0, prompt="x")
         tool = self.uno(self.ev("PostToolUse", 5, tool_name="Read", tool_use_id="u2", duration_ms=2000), "Read")
         self.assertEqual(int(tool["endTimeUnixNano"]) - int(tool["startTimeUnixNano"]), 2 * S)
-        self.assertEqual(self.ev("PreToolUse", 6, tool_name="Read", tool_use_id="u2"), [])
+        self.assertEqual(self.ev("PreToolUse", 6, tool_name="Read", tool_use_id="u2"), [])  # ya terminada: sin marca
         self.assertNotIn("u2", self.r.sesiones["s1"].herr)
 
     def test_subagente_en_vivo(self):
@@ -217,6 +217,12 @@ class TestReconstruccion(Base):
         perdida = self.uno(self.ev("UserPromptSubmit", 2 + trazas.GRACIA + 1, prompt="otra"), "Bash")
         self.assertEqual(perdida["status"]["code"], 2)
         self.assertIn("sin resultado", self.a(perdida)["output.value"])
+
+    def test_marca_de_inicio_de_herramienta(self):
+        raiz = self.uno(self.ev("UserPromptSubmit", 0, prompt="x"), "turno")
+        marca = self.ev("PreToolUse", 1, tool_name="Bash", tool_use_id="u7", tool_input={"command": "make"})[0]
+        self.assertEqual((marca["name"], marca["parentSpanId"]), ("empieza Bash", raiz["spanId"]))
+        self.assertIn("make", self.a(marca)["input.value"])
 
     def test_permiso_denegado(self):
         self.ev("UserPromptSubmit", 0, prompt="x")

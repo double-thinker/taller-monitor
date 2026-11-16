@@ -9,7 +9,8 @@ subagente dure horas. Phoenix no actualiza un span ya recibido, así que:
 - subagente (AGENT): se emite al empezar, con el encargo. Al terminar, hijo `fin del subagente`.
 - modelo (LLM): cada llamada al modelo según llega (el plugin las lee del transcript en cada
   herramienta y al terminar). Se descartan las repetidas por su id.
-- herramienta (TOOL): PostToolUse o PostToolUseFailure. El inicio sale de duration_ms.
+- `empieza <herramienta>` (CHAIN): en PreToolUse, para ver las herramientas largas desde que empiezan.
+- herramienta (TOOL): PostToolUse o PostToolUseFailure, con entrada, salida y duración.
 - herramienta sin resultado: PreToolUse sin PostToolUse pasados GRACIA segundos, o PermissionDenied.
 
 Los eventos pueden llegar desordenados o tarde: cada uno lleva su hora (`ts`) y su padre se decide
@@ -274,6 +275,14 @@ class Reconstructor:
                 s.herr[tu] = {"inicio": ts, "nombre": ev.get("tool_name", "herramienta"), "trace": p["trace"],
                               "padre": p["span"], "entrada": _texto(ev.get("tool_input")),
                               "agente": ev.get("agent_type", "")}
+                # Marca de inicio: una herramienta larga (un Bash de una hora) se ve desde que empieza.
+                # Phoenix no actualiza spans, así que el resultado llegará después en otro span.
+                h = s.herr[tu]
+                self._emitir(self._span(s, sid, trace=h["trace"], span=_id(8), padre=h["padre"],
+                                        nombre=f"empieza {h['nombre']}", tipo="CHAIN", inicio=ts, fin=ts, attrs={
+                                            "tool.name": h["nombre"], "input.value": h["entrada"],
+                                            "input.mime_type": "application/json", "taller.agente": h["agente"],
+                                            "taller.tool_use_id": tu}))
         elif n in ("PostToolUse", "PostToolUseFailure"):
             p = self._padre(s, sid, ev, ts)
             self._llamadas(s, sid, p, msg.get("llamadas"), ts)
