@@ -10,8 +10,10 @@ de datos del plugin y se reintenta en el siguiente evento. Nunca bloquea ni camb
 de Claude Code: ante cualquier error termina con código 0 y sin salida.
 
 Configuración. Gana la variable de entorno, después la opción del plugin y después el fichero
-.claude/taller-monitor.json del repositorio ({"url": ..., "token": ..., "proyecto": ...}):
-  TALLER_MONITOR_URL       o la opción "url"      URL base del receptor
+.claude/taller-monitor.json del repositorio ({"url": ..., "token": ..., "proyecto": ...}). El nombre
+del alumno puede ir en .claude/taller-monitor.local.json ({"alumno": ...}), que no se sube a git:
+  TALLER_MONITOR_URL       o la opción "url"      URL base del receptor; varias separadas por comas
+                                                  (se usa la siguiente si la primera no responde)
   TALLER_MONITOR_TOKEN     o la opción "token"    token que da el profesor
   TALLER_MONITOR_ALUMNO    o la opción "alumno"   nombre visible (por defecto, el correo de git sin dominio)
   TALLER_MONITOR_PROYECTO  o la opción "proyecto" proyecto de Phoenix (por defecto, "taller")
@@ -32,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 MAX_TEXTO = 30_000  # caracteres por campo de texto
 MAX_TRANSCRIPT = 4_000_000  # bytes leídos como máximo del final de un transcript
 MAX_COLA = 500  # eventos pendientes como máximo
@@ -42,11 +44,14 @@ SINCRONOS = ("Stop", "SubagentStop", "SessionEnd", "StopFailure")
 # --------------------------------------------------------------------------- configuración
 
 def config_repo() -> dict:
-    base = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    try:
-        return json.loads((Path(base) / ".claude" / "taller-monitor.json").read_text(encoding="utf-8-sig"))
-    except Exception:
-        return {}
+    base = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()) / ".claude"
+    datos: dict = {}
+    for nombre in ("taller-monitor.json", "taller-monitor.local.json"):
+        try:
+            datos.update(json.loads((base / nombre).read_text(encoding="utf-8-sig")))
+        except Exception:
+            pass
+    return datos
 
 
 def opcion(nombre: str, defecto: str = "", repo: dict | None = None) -> str:
@@ -54,7 +59,8 @@ def opcion(nombre: str, defecto: str = "", repo: dict | None = None) -> str:
     if not v:
         v = os.environ.get(f"CLAUDE_PLUGIN_OPTION_{nombre.upper()}", "").strip()
     if not v and repo:
-        v = str(repo.get(nombre, "") or "").strip()
+        r = repo.get(nombre, "")
+        v = (",".join(r) if isinstance(r, list) else str(r or "")).strip()
     return v or defecto
 
 
@@ -77,10 +83,13 @@ def config() -> dict | None:
         return None
     repo = config_repo()
     url, token = opcion("url", repo=repo), opcion("token", repo=repo)
-    if not url or not token:
+    if isinstance(repo.get("url"), list) and not os.environ.get("TALLER_MONITOR_URL"):
+        url = ",".join(repo["url"])
+    urls = [u.strip().rstrip("/") + "/v1/events" for u in url.split(",") if u.strip()]
+    if not urls or not token:
         return None
     return {
-        "url": url.rstrip("/") + "/v1/events",
+        "urls": urls,
         "token": token,
         "alumno": opcion("alumno", repo=repo) or alumno_por_defecto(),
         "proyecto": opcion("proyecto", "taller", repo=repo),
@@ -121,17 +130,17 @@ def registrar_error(msg: str) -> None:
 
 # --------------------------------------------------------------------------- transcript
 
-def _leer_final(ruta: str) -> list[dict]:
+def _leer_final(ruta: str, maximo: int = MAX_TRANSCRIPT) -> list[dict]:
     try:
         with open(ruta, "rb") as f:
             f.seek(0, os.SEEK_END)
             tam = f.tell()
-            f.seek(max(0, tam - MAX_TRANSCRIPT))
+            f.seek(max(0, tam - maximo))
             bruto = f.read()
     except Exception:
         return []
     lineas = bruto.split(b"\n")
-    if tam > MAX_TRANSCRIPT:
+    if tam > maximo:
         lineas = lineas[1:]  # la primera puede estar cortada
     salida = []
     for l in lineas:
@@ -197,6 +206,30 @@ def llamadas_del_turno(transcript: str) -> list[dict]:
     return _unir(list(reversed(turno)))
 
 
+def llamadas_recientes(transcript: str) -> list[dict]:
+    """Las llamadas al modelo desde el resultado de herramienta anterior: lo nuevo desde el último envío.
+    Se lee solo el final del fichero. El receptor descarta las que ya tenía (por id)."""
+    recientes, resultados = [], 0
+    for e in reversed(_leer_final(transcript, 300_000)):
+        if e.get("type") == "assistant":
+            recientes.append(_llamada(e))
+        elif e.get("type") == "user":
+            if _es_prompt(e):
+                break
+            resultados += 1
+            if resultados >= 2 and recientes:
+                break
+    return _unir(list(reversed(recientes)))
+
+
+def transcript_de(ev: dict) -> str:
+    """Transcript del agente que lanzó el evento: el principal o el del subagente."""
+    tp = ev.get("transcript_path") or ""
+    if ev.get("agent_id") and tp:
+        return str(Path(tp).with_suffix("") / "subagents" / f"agent-{ev['agent_id']}.jsonl")
+    return tp
+
+
 def llamadas_del_subagente(transcript: str) -> list[dict]:
     return _unir([_llamada(e) for e in _leer_final(transcript) if e.get("type") == "assistant"])
 
@@ -204,9 +237,16 @@ def llamadas_del_subagente(transcript: str) -> list[dict]:
 # --------------------------------------------------------------------------- envío y cola
 
 def _post(cfg: dict, cuerpo: bytes, timeout: float) -> bool:
-    """True si el receptor lo aceptó o lo rechazó de forma definitiva (no merece reintento)."""
+    """True si algún receptor lo aceptó o lo rechazó de forma definitiva. Prueba las URLs en orden."""
+    for url in cfg["urls"]:
+        if _post_url(cfg, url, cuerpo, timeout):
+            return True
+    return False
+
+
+def _post_url(cfg: dict, url: str, cuerpo: bytes, timeout: float) -> bool:
     req = urllib.request.Request(
-        cfg["url"], data=cuerpo, method="POST",
+        url, data=cuerpo, method="POST",
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {cfg['token']}",
@@ -217,10 +257,10 @@ def _post(cfg: dict, cuerpo: bytes, timeout: float) -> bool:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status < 300
     except urllib.error.HTTPError as e:
-        registrar_error(f"HTTP {e.code} en {cfg['url']}")
+        registrar_error(f"HTTP {e.code} en {url}")
         return e.code not in (408, 429) and e.code < 500
     except Exception as e:
-        registrar_error(f"{type(e).__name__} en {cfg['url']}: {e}")
+        registrar_error(f"{type(e).__name__} en {url}: {e}")
         return False
 
 
@@ -280,6 +320,10 @@ def construir(ev: dict, cfg: dict) -> dict:
         extra["llamadas"] = llamadas_del_turno(ev["transcript_path"])
     elif nombre == "SubagentStop" and ev.get("agent_transcript_path"):
         extra["llamadas"] = llamadas_del_subagente(ev["agent_transcript_path"])
+    elif nombre in ("PostToolUse", "PostToolUseFailure"):
+        tp = transcript_de(ev)
+        if tp:
+            extra["llamadas"] = llamadas_recientes(tp)
     return recortar({
         "ts": time.time_ns(),
         "alumno": cfg["alumno"],

@@ -38,6 +38,86 @@ DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 import trazas  # noqa: E402
 
 RECONSTRUCTOR = trazas.Reconstructor(os.path.join(DATA, "sesiones"))
+
+
+def _norm_cwd(cwd: str) -> str:
+    return (cwd or "").replace("\\", "/").rstrip("/").lower()
+
+
+class Registro:
+    """Alumnos inscritos (POST /v1/registro) y alumnos de los que llegan datos. Persistido en data/registro.json."""
+
+    def __init__(self, ruta: str):
+        self.ruta = ruta
+        self.lock = threading.Lock()
+        try:
+            with open(ruta, encoding="utf-8") as f:
+                self.datos = json.load(f)
+        except Exception:
+            self.datos = {"alumnos": {}, "cwd": {}}
+
+    def _guardar(self) -> None:
+        tmp = self.ruta + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.datos, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.ruta)
+
+    def inscribir(self, alumno: str, cwd: str = "", so: str = "", via: str = "") -> dict:
+        with self.lock:
+            a = self.datos["alumnos"].setdefault(alumno, {"inscrito": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                          "eventos": 0, "sesiones": [], "vias": []})
+            a.update({k: v for k, v in {"cwd": cwd, "so": so, "via_inscripcion": via}.items() if v})
+            if cwd:
+                self.datos["cwd"][_norm_cwd(cwd)] = alumno
+            self._guardar()
+            return a
+
+    def visto(self, alumno: str, via: str, sesion: str = "", cwd: str = "", so: str = "") -> None:
+        if not alumno:
+            return
+        with self.lock:
+            a = self.datos["alumnos"].setdefault(alumno, {"eventos": 0, "sesiones": [], "vias": []})
+            a["eventos"] = a.get("eventos", 0) + 1
+            a["ultima_vez"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            if via and via not in a["vias"]:
+                a["vias"].append(via)
+            if sesion and sesion not in a["sesiones"]:
+                a["sesiones"] = (a["sesiones"] + [sesion])[-50:]
+            if so:
+                a["so"] = so
+            if cwd and _norm_cwd(cwd) not in self.datos["cwd"]:
+                self.datos["cwd"][_norm_cwd(cwd)] = alumno
+            if a["eventos"] % 20 == 1:  # no reescribir el fichero en cada evento
+                self._guardar()
+
+    def alumno_por_cwd(self, cwd: str) -> str | None:
+        """El alumno inscrito en esa carpeta o en una carpeta que la contiene."""
+        c = _norm_cwd(cwd)
+        mapa = self.datos["cwd"]
+        while c:
+            if c in mapa:
+                return mapa[c]
+            if "/" not in c:
+                return None
+            c = c.rsplit("/", 1)[0]
+        return None
+
+    def consulta(self, alumno: str) -> dict:
+        with self.lock:
+            a = self.datos["alumnos"].get(alumno)
+        if not a:
+            return {"alumno": alumno, "inscrito": False, "recibiendo": False,
+                    "mensaje": "No hay ni inscripción ni datos con ese nombre."}
+        recibiendo = a.get("eventos", 0) > 0
+        return {"alumno": alumno, "inscrito": "inscrito" in a, "recibiendo": recibiendo,
+                "eventos": a.get("eventos", 0), "ultima_vez": a.get("ultima_vez"), "vias": a.get("vias", []),
+                "sesiones": len(a.get("sesiones", [])),
+                "mensaje": "Todo correcto: llegan datos de este alumno." if recibiendo else
+                           "Inscrito, pero aún no ha llegado ningún evento. Abre una sesión nueva de Claude Code "
+                           "en la carpeta del taller (o continúa esta con `claude --continue`) y escribe algo."}
+
+
+REGISTRO = Registro(os.path.join(DATA, "registro.json"))
 PENDIENTES: list[bytes] = []  # lotes que Phoenix no aceptó; se reintentan desde el hilo de barrido
 PENDIENTES_LOCK = threading.Lock()
 
@@ -197,15 +277,36 @@ class Manejador(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(cuerpo)
 
+    def autorizado(self) -> bool:
+        auth = self.headers.get("Authorization", "")
+        return bool(TOKEN) and hmac.compare_digest(auth.encode(), f"Bearer {TOKEN}".encode())
+
+    def json_resp(self, codigo: int, datos: dict) -> None:
+        cuerpo = json.dumps(datos, ensure_ascii=False).encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
     def do_GET(self):
-        if self.path == "/salud":
-            self.responder(200, "ok")
-        else:
-            self.responder(404, "no encontrado")
+        from urllib.parse import parse_qs, urlparse
+
+        u = urlparse(self.path)
+        if u.path == "/salud":
+            return self.responder(200, "ok")
+        if u.path == "/v1/registro":
+            if not self.autorizado():
+                return self.json_resp(401, {"error": "token incorrecto"})
+            alumno = (parse_qs(u.query).get("alumno") or [""])[0].strip()
+            if not alumno:
+                return self.json_resp(400, {"error": "falta ?alumno=<nombre>"})
+            return self.json_resp(200, REGISTRO.consulta(alumno))
+        self.responder(404, "no encontrado")
 
     def do_POST(self):
         origen = self.headers.get("X-Forwarded-For", self.client_address[0])
-        if self.path not in ("/v1/traces", "/v1/logs", "/v1/metrics", "/v1/events"):
+        if self.path not in ("/v1/traces", "/v1/logs", "/v1/metrics", "/v1/events", "/v1/registro", "/v1/feedback"):
             return self.responder(404, "no encontrado")
         auth = self.headers.get("Authorization", "")
         if not TOKEN or not hmac.compare_digest(auth.encode(), f"Bearer {TOKEN}".encode()):
@@ -214,17 +315,40 @@ class Manejador(BaseHTTPRequestHandler):
         largo = int(self.headers.get("Content-Length", "0") or 0)
         if largo <= 0 or largo > MAX_CUERPO:
             return self.responder(413, "cuerpo vacío o demasiado grande")
+        if self.path in ("/v1/registro", "/v1/feedback"):
+            try:
+                datos = json.loads(self.rfile.read(largo))
+                alumno = str(datos.get("alumno") or "").strip()[:100]
+            except Exception:
+                return self.json_resp(400, {"error": "JSON no válido"})
+            if self.path == "/v1/registro":
+                if not alumno:
+                    return self.json_resp(400, {"error": "falta alumno"})
+                REGISTRO.inscribir(alumno, str(datos.get("cwd") or ""), str(datos.get("so") or ""),
+                                   str(datos.get("via") or ""))
+                log("registro", alumno, datos.get("via", ""), origen)
+                return self.json_resp(200, REGISTRO.consulta(alumno))
+            datos["recibido"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            datos["origen"] = origen
+            guardar_jsonl("feedback.jsonl", trazas.recortar_json(datos) if hasattr(trazas, "recortar_json") else datos)
+            log("feedback", alumno or "?", str(datos.get("paso", ""))[:60], origen)
+            return self.json_resp(200, {"ok": True, "mensaje": "Gracias, el profesor lo verá."})
         if self.path == "/v1/events":
             # Eventos de hooks (plugin o hook HTTP): el receptor monta las trazas.
             try:
                 msg = json.loads(self.rfile.read(largo))
                 if "evento" not in msg and self.headers.get("X-Alumno"):
                     msg = {"alumno": self.headers["X-Alumno"], "proyecto": self.headers.get("X-Proyecto"), "evento": msg}
-                proyecto, spans = RECONSTRUCTOR.procesar(msg)
+                proyecto, spans = RECONSTRUCTOR.procesar(msg, REGISTRO.alumno_por_cwd)
             except Exception as e:
                 log("400", origen, "/v1/events", type(e).__name__, str(e)[:200])
                 return self.responder(400, "evento no válido")
             ev = msg.get("evento") or msg
+            sid = ev.get("session_id", "")
+            alumno = RECONSTRUCTOR.sesiones[sid].meta.get("alumno") if sid in RECONSTRUCTOR.sesiones else None
+            REGISTRO.visto(alumno, "plugin" if "evento" in msg else "hook-http", sid, ev.get("cwd", ""),
+                           (msg.get("cliente") or {}).get("so", ""))
+            msg.setdefault("alumno", alumno)
             emitir(proyecto, spans)
             log(200, msg.get("alumno") or "?", ev.get("hook_event_name", "?"), f"{len(spans)} spans", origen)
             return self.responder(200, "")
@@ -242,6 +366,10 @@ class Manejador(BaseHTTPRequestHandler):
             datos = json.loads(self.rfile.read(largo))
             enriquecer_nativo(datos)
             pb, n, alumnos = a_protobuf(datos)
+            for rs in datos.get("resourceSpans", []):
+                ra = _attrs(rs.get("resource", {}).get("attributes"))
+                if ra.get("service.name") == "claude-code" and ra.get("taller.alumno"):
+                    REGISTRO.visto(ra["taller.alumno"], "otel", so=ra.get("os.type", ""))
         except Exception as e:
             log("400", origen, type(e).__name__, str(e)[:200])
             return self.responder(400, "OTLP JSON no válido")

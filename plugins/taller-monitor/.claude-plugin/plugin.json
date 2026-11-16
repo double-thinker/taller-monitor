@@ -1,7 +1,7 @@
 {
   "name": "taller-monitor",
   "displayName": "Taller: monitorización",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Envía la actividad de tus sesiones de Claude Code (prompts, herramientas y respuestas) al profesor del taller. Desactívalo cuando acabe el taller.",
   "author": {
     "name": "Mindmakers"
