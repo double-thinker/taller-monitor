@@ -142,6 +142,8 @@ class TestCola(Base):
 # ------------------------------------------------------------------- receptor
 
 class TestReconstruccion(Base):
+    """Modelo de Phoenix: una traza por turno; la raíz Turn lleva entrada y salida y llega al final."""
+
     def setUp(self):
         super().setUp()
         self.r = trazas.Reconstructor(Path(self.tmp.name) / "sesiones")
@@ -162,99 +164,117 @@ class TestReconstruccion(Base):
     def uno(spans, nombre):
         return [s for s in spans if s["name"] == nombre][0]
 
-    def ll(self, id_, texto, dt=None, ent=10, sal=5):
+    def ll(self, id_, texto, dt=None, ent=10, sal=5, modelo="m"):
         from datetime import datetime, timezone
         ts = datetime.fromtimestamp((self.t + dt * S) / S, timezone.utc).isoformat() if dt is not None else ""
-        return {"id": id_, "modelo": "m", "entrada": ent, "salida": sal, "texto": texto, "ts": ts}
+        return {"id": id_, "modelo": modelo, "entrada": ent, "salida": sal, "texto": texto, "ts": ts}
 
-    def test_raiz_al_empezar_y_cierre_al_final(self):
-        raiz = self.uno(self.ev("UserPromptSubmit", 0, prompt="arregla"), "turno")
-        self.assertNotIn("parentSpanId", raiz)
-        self.assertEqual(self.a(raiz)["input.value"], "arregla")
-        tool = self.ev("PostToolUse", 2, tool_name="Bash", tool_use_id="u1", duration_ms=1000,
-                       tool_response={"stdout": "ok"}, llamadas=[self.ll("m1", "voy", 1)])
-        self.assertEqual({s["name"] for s in tool}, {"modelo", "Bash"})
-        self.assertTrue(all(s["parentSpanId"] == raiz["spanId"] for s in tool))
+    def test_sin_spans_de_sesion(self):
+        self.assertEqual(self.ev("SessionStart", 0, source="startup"), [])
+        self.assertEqual(self.ev("SessionEnd", 1, reason="other"), [])
+
+    def test_turno_hijos_en_vivo_y_raiz_al_final(self):
+        self.assertEqual(self.ev("UserPromptSubmit", 0, prompt="arregla"), [])
+        marca = self.ev("PreToolUse", 1, tool_name="Bash", tool_use_id="u1", tool_input={"command": "make"})[0]
+        self.assertEqual(marca["name"], "Tool started: Bash")
+        hijos = self.ev("PostToolUse", 2, tool_name="Bash", tool_use_id="u1", tool_response={"stdout": "ok"},
+                        llamadas=[self.ll("m1", "voy", 1)])
+        self.assertEqual({s["name"] for s in hijos}, {"LLM call: m", "Bash"})
         cierre = self.ev("Stop", 3, last_assistant_message="hecho", llamadas=[self.ll("m1", "voy", 1), self.ll("m2", "hecho", 3)])
-        self.assertEqual([s["name"] for s in cierre], ["modelo", "fin del turno"])  # m1 ya estaba: no se repite
-        fin = self.a(cierre[-1])
-        self.assertEqual((fin["output.value"], fin["llm.token_count.total"], fin["taller.duracion_s"]), ("hecho", "30", 3.0))
-        self.assertEqual(self.a(raiz)["taller.proyecto_local"], "x")
+        raiz = cierre[-1]
+        self.assertEqual([s["name"] for s in cierre], ["LLM call: m", "Turn"])  # m1 ya enviada: no se repite
+        self.assertNotIn("parentSpanId", raiz)
+        for s in [marca] + hijos + cierre[:-1]:
+            self.assertEqual((s["traceId"], s["parentSpanId"]), (raiz["traceId"], raiz["spanId"]))
+        a = self.a(raiz)
+        self.assertEqual((a["input.value"], a["output.value"], a["user.id"], a["session.id"]), ("arregla", "hecho", "ana", "s1"))
+        self.assertNotIn("llm.token_count.total", a)  # Phoenix suma los tokens de los hijos LLM
+        self.assertEqual(a["workshop.tool_count"], "1")
+        self.assertEqual(int(raiz["endTimeUnixNano"]) - int(raiz["startTimeUnixNano"]), 3 * S)
+        self.assertEqual(self.a(hijos[1])["tool.call.id"], "u1")
 
-    def test_post_antes_que_pre_usa_duration_ms(self):
+    def test_herramienta_fallida_lleva_error_message(self):
         self.ev("UserPromptSubmit", 0, prompt="x")
-        tool = self.uno(self.ev("PostToolUse", 5, tool_name="Read", tool_use_id="u2", duration_ms=2000), "Read")
-        self.assertEqual(int(tool["endTimeUnixNano"]) - int(tool["startTimeUnixNano"]), 2 * S)
-        self.assertEqual(self.ev("PreToolUse", 6, tool_name="Read", tool_use_id="u2"), [])  # ya terminada: sin marca
-        self.assertNotIn("u2", self.r.sesiones["s1"].herr)
+        s = self.ev("PostToolUseFailure", 1, tool_name="Read", tool_use_id="u2", error="File does not exist")[0]
+        self.assertEqual(s["status"]["code"], 2)
+        self.assertEqual(self.a(s)["error.message"], "File does not exist")
 
-    def test_subagente_en_vivo(self):
-        raiz = self.uno(self.ev("UserPromptSubmit", 0, prompt="explora"), "turno")
+    def test_subagente_hijos_en_vivo_y_span_al_final(self):
+        self.ev("UserPromptSubmit", 0, prompt="explora")
         self.ev("PreToolUse", 1, tool_name="Agent", tool_use_id="a1", tool_input={"prompt": "busca el bug", "subagent_type": "Explore"})
-        sub = self.uno(self.ev("SubagentStart", 1, agent_id="ag1", agent_type="Explore"), "subagente Explore")
-        self.assertEqual(sub["parentSpanId"], raiz["spanId"])
-        self.assertEqual(self.a(sub)["input.value"], "busca el bug")
-        en_vivo = self.ev("PostToolUse", 2, tool_name="Grep", tool_use_id="u3", agent_id="ag1", llamadas=[self.ll("s1", "pienso", 2)])
-        self.assertTrue(all(s["parentSpanId"] == sub["spanId"] for s in en_vivo))
+        self.assertEqual(self.ev("SubagentStart", 1, agent_id="ag1", agent_type="Explore"), [])
+        vivo = self.ev("PostToolUse", 2, tool_name="Grep", tool_use_id="u3", agent_id="ag1", agent_type="Explore",
+                       llamadas=[self.ll("s1", "pienso", 2)])
         fin = self.ev("SubagentStop", 3, agent_id="ag1", last_assistant_message="informe", llamadas=[self.ll("s1", "pienso", 2)])
-        self.assertEqual([s["name"] for s in fin], ["fin del subagente"])
-        self.assertEqual(self.a(fin[0])["output.value"], "informe")
-        self.assertEqual(self.a(fin[0])["llm.token_count.total"], "15")
+        sub = self.uno(fin, "Subagent: Explore")
+        self.assertTrue(all(s["parentSpanId"] == sub["spanId"] for s in vivo))
+        a = self.a(sub)
+        self.assertEqual((a["input.value"], a["output.value"], a["subagent.id"]), ("busca el bug", "informe", "ag1"))
+        raiz = self.ev("Stop", 4, llamadas=[])[-1]
+        self.assertEqual(sub["parentSpanId"], raiz["spanId"])
 
     def test_subagente_en_segundo_plano_tras_stop(self):
-        raiz = self.uno(self.ev("UserPromptSubmit", 0, prompt="lanza"), "turno")
+        self.ev("UserPromptSubmit", 0, prompt="lanza")
         self.ev("SubagentStart", 1, agent_id="ag2", agent_type="general-purpose")
-        self.ev("Stop", 2, llamadas=[])
+        raiz = self.ev("Stop", 2, llamadas=[])[-1]
         t = self.uno(self.ev("PostToolUse", 5, tool_name="Bash", tool_use_id="u4", agent_id="ag2"), "Bash")
-        fin = self.ev("SubagentStop", 6, agent_id="ag2")[0]
-        self.assertEqual(t["traceId"], raiz["traceId"])
-        self.assertEqual(t["parentSpanId"], fin["parentSpanId"])
+        sub = self.ev("SubagentStop", 6, agent_id="ag2")[-1]
+        self.assertEqual((t["traceId"], t["parentSpanId"]), (raiz["traceId"], sub["spanId"]))
+        self.assertEqual(sub["parentSpanId"], raiz["spanId"])
 
     def test_herramienta_sin_resultado_caduca(self):
         self.ev("UserPromptSubmit", 0, prompt="x")
         self.ev("PreToolUse", 1, tool_name="Bash", tool_use_id="u5", tool_input={"command": "sleep 30"})
         self.ev("Stop", 2, llamadas=[])
-        perdida = self.uno(self.ev("UserPromptSubmit", 2 + trazas.GRACIA + 1, prompt="otra"), "Bash")
+        perdida = self.uno(self.ev("UserPromptSubmit", 2 + trazas.GRACE + 1, prompt="otra"), "Bash")
         self.assertEqual(perdida["status"]["code"], 2)
-        self.assertIn("sin resultado", self.a(perdida)["output.value"])
-
-    def test_marca_de_inicio_de_herramienta(self):
-        raiz = self.uno(self.ev("UserPromptSubmit", 0, prompt="x"), "turno")
-        marca = self.ev("PreToolUse", 1, tool_name="Bash", tool_use_id="u7", tool_input={"command": "make"})[0]
-        self.assertEqual((marca["name"], marca["parentSpanId"]), ("empieza Bash", raiz["spanId"]))
-        self.assertIn("make", self.a(marca)["input.value"])
+        self.assertIn("no result", self.a(perdida)["error.message"])
 
     def test_permiso_denegado(self):
         self.ev("UserPromptSubmit", 0, prompt="x")
         self.ev("PreToolUse", 1, tool_name="Bash", tool_use_id="u6")
-        s = self.ev("PermissionDenied", 2, tool_name="Bash", tool_use_id="u6", reason="clasificador")[0]
-        self.assertIn("denegada: clasificador", self.a(s)["output.value"])
+        s = self.ev("PermissionDenied", 2, tool_name="Bash", tool_use_id="u6", reason="classifier")[0]
+        self.assertIn("permission denied: classifier", self.a(s)["error.message"])
 
     def test_aviso_de_subagente_y_error_de_api(self):
-        self.assertEqual(self.ev("UserPromptSubmit", 0, prompt="<task-notification>x</task-notification>")[0]["name"], "aviso de subagente")
-        self.ev("Stop", 1, llamadas=[])
+        self.ev("UserPromptSubmit", 0, prompt="<task-notification>x</task-notification>")
+        self.assertEqual(self.ev("Stop", 1, llamadas=[])[-1]["name"], "Turn (subagent notification)")
         self.ev("UserPromptSubmit", 2, prompt="hola")
-        self.assertEqual(self.ev("StopFailure", 3, error="overloaded")[-1]["status"]["code"], 2)
+        raiz = self.ev("StopFailure", 3, error="overloaded")[-1]
+        self.assertEqual((raiz["name"], raiz["status"]["code"]), ("Turn", 2))
+
+    def test_turno_interrumpido_se_cierra_al_siguiente_prompt(self):
+        self.ev("UserPromptSubmit", 0, prompt="primero")
+        raiz = self.ev("UserPromptSubmit", 10, prompt="segundo")[-1]
+        self.assertEqual((raiz["name"], self.a(raiz)["workshop.close_reason"]), ("Turn", "interrupted"))
 
     def test_llamadas_de_un_turno_sin_stop_van_a_su_turno(self):
-        r1 = self.uno(self.ev("UserPromptSubmit", 0, prompt="primero"), "turno")
-        self.ev("UserPromptSubmit", 10, prompt="segundo")  # sin Stop antes
+        r1 = self.ev("UserPromptSubmit", 0, prompt="primero") or None
+        primero = self.ev("UserPromptSubmit", 10, prompt="segundo")[-1]
         spans = self.ev("Stop", 20, llamadas=[self.ll("a", "del primero", 5), self.ll("b", "del segundo", 15)])
-        llm = {self.a(s)["output.value"]: s for s in spans if s["name"] == "modelo"}
-        self.assertEqual(llm["del primero"]["parentSpanId"], r1["spanId"])
-        self.assertNotEqual(llm["del segundo"]["traceId"], r1["traceId"])
+        llm = {self.a(s)["output.value"]: s for s in spans if s["name"].startswith("LLM call")}
+        self.assertEqual(llm["del primero"]["parentSpanId"], primero["spanId"])
+        self.assertEqual(llm["del segundo"]["parentSpanId"], spans[-1]["spanId"])
+
+    def test_llamadas_que_stop_no_vio_llegan_con_el_siguiente_prompt(self):
+        self.ev("UserPromptSubmit", 0, prompt="hola")
+        raiz = self.ev("Stop", 2, llamadas=[])[-1]
+        tarde = self.ev("UserPromptSubmit", 5, prompt="otra", llamadas=[self.ll("z", "respuesta", 1)])
+        self.assertEqual([(s["name"], s["parentSpanId"]) for s in tarde], [("LLM call: m", raiz["spanId"])])
+        fin = self.ev("SessionEnd", 6, llamadas=[self.ll("z", "respuesta", 1)])
+        self.assertEqual([s["name"] for s in fin], ["Turn"])  # cierra "otra"; la llamada z ya estaba: no se repite
 
     def test_hook_http_sin_envoltorio_y_alumno_por_carpeta(self):
-        _, spans = self.r.procesar({"hook_event_name": "UserPromptSubmit", "session_id": "s9", "prompt": "hola",
-                                    "cwd": "/home/eva/taller/a"}, alumno_por_cwd=lambda c: "eva" if c else None)
-        self.assertEqual(self.a(spans[0])["user.id"], "eva")
-        self.assertEqual(self.a(spans[0])["taller.cliente"], "hook-http")
+        self.r.procesar({"hook_event_name": "UserPromptSubmit", "session_id": "s9", "prompt": "hola",
+                         "cwd": "/home/eva/taller/a"}, alumno_por_cwd=lambda c: "eva" if c else None)
+        _, spans = self.r.procesar({"hook_event_name": "Stop", "session_id": "s9", "cwd": "/home/eva/taller/a"})
+        a = self.a(spans[-1])
+        self.assertEqual((a["user.id"], a["workshop.client"]), ("eva", "http-hooks"))
 
     def test_estado_sobrevive_a_un_reinicio(self):
         self.ev("UserPromptSubmit", 0, prompt="antes del reinicio")
         self.r = trazas.Reconstructor(Path(self.tmp.name) / "sesiones")
-        fin = self.ev("Stop", 1, llamadas=[])[-1]
-        self.assertEqual(self.a(fin)["input.value"], "antes del reinicio")
+        self.assertEqual(self.a(self.ev("Stop", 1, llamadas=[])[-1])["input.value"], "antes del reinicio")
 
 
 try:
@@ -271,13 +291,14 @@ except Exception:
 class TestProtobuf(Base):
     def test_lote_a_protobuf(self):
         r = trazas.Reconstructor(Path(self.tmp.name) / "s")
-        proyecto, spans = r.procesar({"ts": 1, "alumno": "ana", "evento": {"hook_event_name": "UserPromptSubmit", "session_id": "a", "prompt": "p"}})
+        r.procesar({"ts": 1, "alumno": "ana", "evento": {"hook_event_name": "UserPromptSubmit", "session_id": "a", "prompt": "p"}})
+        proyecto, spans = r.procesar({"ts": 2, "alumno": "ana", "evento": {"hook_event_name": "Stop", "session_id": "a"}})
         pb, n, _ = receptor.a_protobuf(trazas.lote(proyecto, spans))
         self.assertEqual(n, 1)
         from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
 
         msg = trace_service_pb2.ExportTraceServiceRequest.FromString(pb)
-        self.assertEqual(msg.resource_spans[0].scope_spans[0].spans[0].name, "turno")
+        self.assertEqual(msg.resource_spans[0].scope_spans[0].spans[0].name, "Turn")
 
     def test_registro(self):
         reg = receptor.Registro(str(Path(self.tmp.name) / "registro.json"))

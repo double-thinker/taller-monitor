@@ -10,19 +10,22 @@ Las sesiones de Claude Code de los alumnos llegan a un Phoenix local (`http://12
 
 ## Datos
 
-Cada alumno es un `user.id`. Cada sesión de Claude Code es un `session.id`. Spans que vas a encontrar:
+Cada alumno es un `user.id`. Cada sesión de Claude Code es un `session.id` (vista Sessions de Phoenix). Cada turno es una traza. Spans:
 
 | Span | Tipo | Qué contiene |
 |---|---|---|
-| `turno` | AGENT, raíz de la traza | `input.value`: el prompt del alumno. `output.value`: la respuesta final. `taller.herramientas`, `taller.errores`, `taller.cierre` (normal, interrumpido, error, fin de sesión), tokens |
-| `modelo` | LLM, hijo de `turno` | Cada llamada al modelo: modelo, tokens y texto |
-| `Bash`, `Edit`, `Read`... | TOOL, hijo de `turno` | `input.value`: argumentos en JSON. `output.value`: resultado. Estado de error si la herramienta falló |
-| `subagente <tipo>` | AGENT | Un subagente: su respuesta final y, colgando de él, sus llamadas al modelo y sus herramientas |
-| `aviso de subagente` | AGENT, raíz | Turno que abre Claude Code cuando termina un subagente en segundo plano |
-| Herramienta en rojo con `taller.sin_resultado` | TOOL | Empezó y no terminó (denegada o interrumpida), o se denegó el permiso |
-| `inicio de sesión`, `fin de sesión`, `compactación de contexto` | CHAIN | Marcas de la sesión |
+| `Turn` | AGENT, raíz de la traza | `input.value`: el prompt del alumno. `output.value`: la respuesta final. `workshop.close_reason` (stop, interrupted, error, session_end), `workshop.tool_count`, `workshop.tool_errors` |
+| `Turn (subagent notification)` | AGENT, raíz | Turno que abre Claude Code cuando termina un subagente en segundo plano |
+| `LLM call: <modelo>` | LLM | Cada llamada al modelo: tokens (también caché) y texto |
+| `Bash`, `Edit`, `Read`... | TOOL | `input.value`: argumentos en JSON. `output.value`: resultado. Si falló, estado ERROR y `error.message`. `workshop.no_result`: empezó y no terminó (denegada o interrumpida) |
+| `Tool started: <herramienta>` | CHAIN | Marca de inicio: una herramienta larga se ve desde que empieza |
+| `Agent` | TOOL | La llamada que lanza un subagente, con su encargo |
+| `Subagent: <tipo>` | AGENT | Un subagente: su encargo y su respuesta. Sus llamadas al modelo y sus herramientas cuelgan de él |
+| `Context compaction` | CHAIN | Compactación del contexto dentro de un turno |
 
-`taller.proyecto_local` es la carpeta en la que trabaja el alumno. El proyecto de Phoenix por defecto es `taller`.
+Mientras un turno o un subagente sigue en marcha, sus hijos ya están en Phoenix pero el span padre aún no (se emite al terminar, con su entrada y su salida). Phoenix muestra esa traza con el primer hijo como raíz provisional.
+
+`workshop.folder` es la carpeta en la que trabaja el alumno y `workshop.os` su sistema. El proyecto de Phoenix por defecto es `taller`.
 
 ## Cómo leerlos
 

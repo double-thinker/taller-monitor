@@ -85,11 +85,12 @@ Para parar todo: `./parar.sh`. Los datos quedan en `receptor/data/` (Phoenix usa
 ## Cómo funciona
 
 - **Plugin del alumno** (`plugins/taller-monitor/hooks/monitor.py`): sin estado ni cerrojos. En cada evento de Claude Code (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionDenied`, `SubagentStart`, `SubagentStop`, `PreCompact`, `Stop`, `StopFailure`, `SessionEnd`) reenvía el evento tal cual al receptor (`POST /v1/events`) con su hora. En `Stop` y `SubagentStop` añade las llamadas al modelo leídas del transcript local (modelo, tokens y texto), que el receptor no puede ver. Si el envío falla, el evento se guarda como un fichero suelto en `cola/`, dentro del directorio de datos del plugin (`~/.claude/plugins/data/taller-monitor-taller-monitor/`), y se reintenta en el siguiente evento. Los fallos quedan en `errores.log`, en ese mismo directorio. Nunca bloquea ni cambia el comportamiento de Claude Code.
-- **Receptor** (`receptor/receptor.py` y `receptor/trazas.py`): comprueba el token, guarda el estado de cada sesión y monta las trazas [OpenInference](https://github.com/Arize-ai/openinference) para Phoenix:
-  - `turno` (AGENT), con el prompt, la respuesta y los tokens. Los avisos de subagentes en segundo plano salen como `aviso de subagente`.
-  - `modelo` (LLM), una por llamada al modelo.
-  - Herramientas (TOOL), con entrada y salida. Las que empiezan y no terminan en 90 s, o que se deniegan, salen en rojo como "sin resultado" o "denegada".
-  - `subagente <tipo>` (AGENT), con sus propias herramientas y llamadas al modelo colgando de él, también si termina después del turno que lo lanzó.
+- **Receptor** (`receptor/receptor.py` y `receptor/trazas.py`): comprueba el token, guarda el estado de cada sesión y monta trazas [OpenInference](https://github.com/Arize-ai/openinference) con el mismo modelo que el plugin oficial de Arize para Claude Code:
+  - Una traza por turno. La raíz `Turn` (AGENT) lleva el prompt y la respuesta: de ahí lee Phoenix la conversación en la vista Sessions.
+  - `LLM call: <modelo>` (LLM) por cada llamada al modelo, con tokens. Phoenix suma los tokens del turno a partir de estos spans.
+  - Herramientas (TOOL) con entrada, salida, `tool.call.id` y `error.message`. Las que empiezan y no terminan, o se deniegan, salen en error con `workshop.no_result`.
+  - `Subagent: <tipo>` (AGENT), con sus llamadas y herramientas colgando de él.
+  - **En vivo:** los ids del turno y de cada subagente se reservan al empezar y sus hijos se envían en cuanto ocurren; el span padre se emite al terminar, con la entrada y la salida definitivas. Mientras tanto, Phoenix muestra la traza con el primer hijo como raíz provisional. Una herramienta larga se ve desde que empieza con la marca `Tool started: <herramienta>`.
 - **Otras fuentes que acepta el receptor:**
   - Hooks HTTP de Claude Code (`"type": "http"`) contra `/v1/events`, con la cabecera `X-Alumno`. No necesitan nada instalado, pero no envían tokens ni `SessionStart`.
   - Telemetría nativa de Claude Code (`OTEL_EXPORTER_OTLP_ENDPOINT` con `http/json`): las trazas se traducen a OpenInference y van al proyecto `taller-otel`; eventos y métricas se guardan en `receptor/data/`.

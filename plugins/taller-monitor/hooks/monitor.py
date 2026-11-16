@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 MAX_TEXTO = 30_000  # caracteres por campo de texto
 MAX_TRANSCRIPT = 4_000_000  # bytes leídos como máximo del final de un transcript
 MAX_COLA = 500  # eventos pendientes como máximo
@@ -173,6 +173,8 @@ def _llamada(e: dict) -> dict:
         "entrada": sum(int(uso.get(k, 0) or 0) for k in
                        ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")),
         "salida": int(uso.get("output_tokens", 0) or 0),
+        "cache_lectura": int(uso.get("cache_read_input_tokens", 0) or 0),
+        "cache_escritura": int(uso.get("cache_creation_input_tokens", 0) or 0),
         "texto": "\n".join(p.get("text", "") for p in partes if isinstance(p, dict) and p.get("type") == "text"),
         "herramientas": [p.get("name", "") for p in partes if isinstance(p, dict) and p.get("type") == "tool_use"],
         "ts": e.get("timestamp", ""),
@@ -317,6 +319,17 @@ def construir(ev: dict, cfg: dict) -> dict:
     nombre = ev.get("hook_event_name", "")
     extra: dict = {}
     if nombre == "Stop" and ev.get("transcript_path"):
+        # Claude Code dispara Stop antes de terminar de escribir la última respuesta en el transcript:
+        # se espera un poco a que aparezca (como mucho ~1,5 s).
+        final = (ev.get("last_assistant_message") or "").strip()[:200]
+        for _ in range(6):
+            llamadas = llamadas_del_turno(ev["transcript_path"])
+            if not final or any(final[:80] in (c.get("texto") or "") for c in llamadas):
+                break
+            time.sleep(0.25)
+        extra["llamadas"] = llamadas
+    elif nombre in ("UserPromptSubmit", "SessionEnd") and ev.get("transcript_path"):
+        # Lo que faltara del turno anterior; el receptor descarta lo que ya tenía.
         extra["llamadas"] = llamadas_del_turno(ev["transcript_path"])
     elif nombre == "SubagentStop" and ev.get("agent_transcript_path"):
         extra["llamadas"] = llamadas_del_subagente(ev["agent_transcript_path"])

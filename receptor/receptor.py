@@ -345,7 +345,7 @@ class Manejador(BaseHTTPRequestHandler):
                 return self.responder(400, "evento no válido")
             ev = msg.get("evento") or msg
             sid = ev.get("session_id", "")
-            alumno = RECONSTRUCTOR.sesiones[sid].meta.get("alumno") if sid in RECONSTRUCTOR.sesiones else None
+            alumno = RECONSTRUCTOR.sessions[sid].meta.get("student") if sid in RECONSTRUCTOR.sessions else None
             REGISTRO.visto(alumno, "plugin" if "evento" in msg else "hook-http", sid, ev.get("cwd", ""),
                            (msg.get("cliente") or {}).get("so", ""))
             msg.setdefault("alumno", alumno)

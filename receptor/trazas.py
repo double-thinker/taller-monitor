@@ -1,20 +1,22 @@
-"""Reconstrucción de trazas OpenInference a partir de los eventos de hooks de Claude Code.
+"""Builds OpenInference traces for Phoenix from Claude Code hook events.
 
-El cliente (plugin o hook HTTP) manda cada evento tal cual. Aquí se guarda el estado de cada sesión y
-se emiten spans en cuanto se sabe algo, para que el profesor lo vea en vivo aunque un turno o un
-subagente dure horas. Phoenix no actualiza un span ya recibido, así que:
+The client (plugin or HTTP hook) forwards each event as is. This module keeps per-session state and
+emits spans following the same model as Arize's own Claude Code tracing plugin:
 
-- turno (AGENT, raíz): se emite al empezar, con el prompt. Al terminar se añade el hijo
-  `fin del turno` con la respuesta, los tokens y la duración.
-- subagente (AGENT): se emite al empezar, con el encargo. Al terminar, hijo `fin del subagente`.
-- modelo (LLM): cada llamada al modelo según llega (el plugin las lee del transcript en cada
-  herramienta y al terminar). Se descartan las repetidas por su id.
-- `empieza <herramienta>` (CHAIN): en PreToolUse, para ver las herramientas largas desde que empiezan.
-- herramienta (TOOL): PostToolUse o PostToolUseFailure, con entrada, salida y duración.
-- herramienta sin resultado: PreToolUse sin PostToolUse pasados GRACIA segundos, o PermissionDenied.
+- One trace per turn. Its root span `Turn` (AGENT) carries the prompt (`input.value`), the final
+  answer (`output.value`) and the token totals. Phoenix's Sessions view reads the conversation from
+  these root spans.
+- `LLM call: <model>` (LLM): every model call, with tokens and text.
+- Tools (TOOL), named after the tool, with input, output, `tool.call.id` and `error.message`.
+- `Subagent: <type>` (AGENT): a subagent, with its own LLM calls and tools as children.
 
-Los eventos pueden llegar desordenados o tarde: cada uno lleva su hora (`ts`) y su padre se decide
-con lo que se sabía cuando empezó.
+Live view: span ids for the turn and for each subagent are reserved when they start, and their
+children are sent as soon as they happen. The parent span itself is emitted when it ends, with the
+right start time and its final input and output. Until then Phoenix shows the trace with its first
+child as a provisional root; when the real root arrives it takes over (checked against Phoenix 21).
+A long-running tool shows up from the start through a `Tool started: <name>` marker span.
+
+Events may arrive late or out of order: each one carries its own time (`ts`).
 """
 
 from __future__ import annotations
@@ -27,16 +29,17 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-MAX_TEXTO = 30_000
-GRACIA = 90  # segundos antes de dar por perdida una herramienta sin resultado
+MAX_TEXT = 30_000
+GRACE = 90  # seconds before a tool that started but never finished is reported
 S = 1_000_000_000
+GRACIA = GRACE  # backwards-compatible name
 
 
 def _id(n: int) -> str:
     return secrets.token_hex(n)
 
 
-def _texto(v) -> str:
+def _text(v) -> str:
     if v is None:
         return ""
     if not isinstance(v, str):
@@ -44,331 +47,334 @@ def _texto(v) -> str:
             v = json.dumps(v, ensure_ascii=False)
         except Exception:
             v = str(v)
-    return v if len(v) <= MAX_TEXTO else v[:MAX_TEXTO] + f"\n[... recortado, {len(v)} caracteres]"
+    return v if len(v) <= MAX_TEXT else v[:MAX_TEXT] + f"\n[... truncated, {len(v)} characters]"
 
 
-def _atributo(clave: str, valor) -> dict:
-    if isinstance(valor, bool):
-        return {"key": clave, "value": {"boolValue": valor}}
-    if isinstance(valor, int):
-        return {"key": clave, "value": {"intValue": str(valor)}}
-    if isinstance(valor, float):
-        return {"key": clave, "value": {"doubleValue": valor}}
-    return {"key": clave, "value": {"stringValue": _texto(valor)}}
+def _attribute(key: str, value) -> dict:
+    if isinstance(value, bool):
+        return {"key": key, "value": {"boolValue": value}}
+    if isinstance(value, int):
+        return {"key": key, "value": {"intValue": str(value)}}
+    if isinstance(value, float):
+        return {"key": key, "value": {"doubleValue": value}}
+    return {"key": key, "value": {"stringValue": _text(value)}}
 
 
-def _ts_iso(ts: str, defecto: int) -> int:
+def _ts_iso(ts: str, default: int) -> int:
     try:
         return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * S)
     except Exception:
-        return defecto
+        return default
 
 
-def carpeta(cwd: str) -> str:
+def folder(cwd: str) -> str:
     return os.path.basename((cwd or "").replace("\\", "/").rstrip("/"))
 
 
-class Sesion:
-    """Estado de una sesión de Claude Code. Solo lo toca el receptor, bajo su cerrojo."""
+class Session:
+    """State of one Claude Code session. Only the receiver touches it, under its lock."""
 
-    CAMPOS = ("turno", "ultimo", "herr", "hechas", "agentes", "encargos", "llm_vistos", "llm_fin", "meta")
+    FIELDS = ("turn", "last", "tools", "done", "agents", "briefs", "llm_seen", "llm_end", "meta")
 
     def __init__(self, d: dict | None = None):
         d = d or {}
-        self.turno: dict | None = d.get("turno")
-        self.ultimo: dict | None = d.get("ultimo")
-        self.herr: dict = d.get("herr", {})          # tool_use_id -> herramienta empezada
-        self.hechas: list = d.get("hechas", [])      # tool_use_id cerrados
-        self.agentes: dict = d.get("agentes", {})    # agent_id -> subagente en curso
-        self.encargos: list = d.get("encargos", [])  # prompts de herramientas Agent aún sin subagente
-        self.llm_vistos: list = d.get("llm_vistos", [])
-        self.llm_fin: dict = d.get("llm_fin", {})    # span padre -> fin de la última llamada al modelo
+        self.turn: dict | None = d.get("turn")
+        self.last: dict | None = d.get("last")
+        self.tools: dict = d.get("tools", {})        # tool_use_id -> started tool
+        self.done: list = d.get("done", [])          # finished tool_use_ids
+        self.agents: dict = d.get("agents", {})      # agent_id -> running subagent
+        self.briefs: list = d.get("briefs", [])      # prompts of Agent tool calls not yet matched
+        self.llm_seen: list = d.get("llm_seen", [])
+        self.llm_end: dict = d.get("llm_end", {})    # parent span -> end of its last LLM call
         self.meta: dict = d.get("meta", {})
 
-    def a_dict(self) -> dict:
-        self.hechas = self.hechas[-1000:]
-        self.llm_vistos = self.llm_vistos[-2000:]
-        return {c: getattr(self, c) for c in self.CAMPOS}
+    def to_dict(self) -> dict:
+        self.done = self.done[-1000:]
+        self.llm_seen = self.llm_seen[-2000:]
+        return {f: getattr(self, f) for f in self.FIELDS}
 
 
 class Reconstructor:
-    def __init__(self, dir_estado: str | Path):
-        self.dir = Path(dir_estado)
+    def __init__(self, state_dir: str | Path):
+        self.dir = Path(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.sesiones: dict[str, Sesion] = {}
-        self.cerrojo = threading.Lock()
-        self._salida: list = []
+        self.sessions: dict[str, Session] = {}
+        self.lock = threading.Lock()
+        self._out: list = []
 
-    # ---------------------------------------------------------------- estado
+    # ---------------------------------------------------------------- state
 
-    def _ruta(self, sid: str) -> Path:
-        return self.dir / (("".join(c for c in sid if c.isalnum() or c in "-_") or "sin-sesion") + ".json")
+    def _path(self, sid: str) -> Path:
+        return self.dir / (("".join(c for c in sid if c.isalnum() or c in "-_") or "no-session") + ".json")
 
-    def _sesion(self, sid: str) -> Sesion:
-        if sid not in self.sesiones:
+    def _session(self, sid: str) -> Session:
+        if sid not in self.sessions:
             try:
-                self.sesiones[sid] = Sesion(json.loads(self._ruta(sid).read_text("utf-8")))
+                self.sessions[sid] = Session(json.loads(self._path(sid).read_text("utf-8")))
             except Exception:
-                self.sesiones[sid] = Sesion()
-        return self.sesiones[sid]
+                self.sessions[sid] = Session()
+        return self.sessions[sid]
 
-    def _guardar(self, sid: str) -> None:
-        ruta = self._ruta(sid)
-        tmp = ruta.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.sesiones[sid].a_dict(), ensure_ascii=False), "utf-8")
-        os.replace(tmp, ruta)
+    def _save(self, sid: str) -> None:
+        path = self._path(sid)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.sessions[sid].to_dict(), ensure_ascii=False), "utf-8")
+        os.replace(tmp, path)
 
     # ---------------------------------------------------------------- spans
 
-    def _span(self, s: Sesion, sid, *, trace, span, padre, nombre, tipo, inicio, fin, attrs, error=None) -> dict:
-        base = {"openinference.span.kind": tipo, "session.id": sid, "user.id": s.meta.get("alumno", "")}
-        for k in ("taller.cwd", "taller.proyecto_local", "taller.so", "taller.cliente"):
+    def _span(self, s: Session, sid, *, trace, span, parent, name, kind, start, end, attrs, error=None) -> dict:
+        base = {"openinference.span.kind": kind, "session.id": sid, "user.id": s.meta.get("student", "")}
+        for k in ("workshop.cwd", "workshop.folder", "workshop.os", "workshop.client"):
             if s.meta.get(k):
                 base[k] = s.meta[k]
         base.update({k: v for k, v in attrs.items() if v not in (None, "")})
+        if error:
+            base["error.message"] = _text(error)
         out = {
-            "traceId": trace, "spanId": span, "name": nombre, "kind": 1,
-            "startTimeUnixNano": str(int(inicio)), "endTimeUnixNano": str(int(max(fin, inicio))),
-            "attributes": [_atributo(k, v) for k, v in base.items()],
-            "status": {"code": 2, "message": _texto(error)[:500]} if error else {"code": 1},
+            "traceId": trace, "spanId": span, "name": name, "kind": 1,
+            "startTimeUnixNano": str(int(start)), "endTimeUnixNano": str(int(max(end, start))),
+            "attributes": [_attribute(k, v) for k, v in base.items()],
+            "status": {"code": 2, "message": _text(error)[:500]} if error else {"code": 1},
         }
-        if padre:
-            out["parentSpanId"] = padre
+        if parent:
+            out["parentSpanId"] = parent
         return out
 
-    def _emitir(self, span: dict) -> None:
-        self._salida.append(span)
+    def _emit(self, span: dict) -> None:
+        self._out.append(span)
 
-    def _abrir_turno(self, s: Sesion, sid, ts: int, prompt: str = "") -> dict:
-        nombre = "turno"
-        if prompt.lstrip().startswith("<task-notification"):
-            nombre = "aviso de subagente"
-        elif not prompt:
-            nombre = "turno sin prompt"
-        s.turno = {"trace": _id(16), "span": _id(8), "inicio": ts, "prompt": prompt, "n_tools": 0, "errores": 0,
-                   "ent": 0, "sal": 0, "modelo": ""}
-        self._emitir(self._span(s, sid, trace=s.turno["trace"], span=s.turno["span"], padre=None, nombre=nombre,
-                                tipo="AGENT", inicio=ts, fin=ts, attrs={"input.value": prompt}))
-        return s.turno
+    def _open_turn(self, s: Session, ts: int, prompt: str = "") -> dict:
+        """Reserves the ids of a new turn. Its root span is emitted when it closes."""
+        s.turn = {"trace": _id(16), "span": _id(8), "start": ts, "prompt": prompt, "tools": 0, "errors": 0,
+                  "in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "model": ""}
+        return s.turn
 
-    def _turno_o_ultimo(self, s: Sesion, sid, ts: int) -> dict:
-        return s.turno or s.ultimo or self._abrir_turno(s, sid, ts)
+    def _turn_or_last(self, s: Session, ts: int) -> dict:
+        return s.turn or s.last or self._open_turn(s, ts)
 
-    def _agente(self, s: Sesion, sid, ev: dict, ts: int) -> dict:
-        """El subagente de un evento. Si es nuevo, se emite su span al momento, colgando del turno."""
+    def _agent(self, s: Session, ev: dict, ts: int) -> dict:
+        """The subagent an event belongs to. Its span is emitted when it stops."""
         aid = ev["agent_id"]
-        if aid not in s.agentes:
-            t = self._turno_o_ultimo(s, sid, ts)
-            encargo = s.encargos.pop(0) if s.encargos else {}
-            tipo = ev.get("agent_type") or encargo.get("tipo", "")
-            ag = {"trace": t["trace"], "span": _id(8), "padre": t["span"], "inicio": ts, "tipo": tipo,
-                  "ent": 0, "sal": 0, "modelo": ""}
-            s.agentes[aid] = ag
-            self._emitir(self._span(s, sid, trace=ag["trace"], span=ag["span"], padre=ag["padre"],
-                                    nombre=f"subagente {tipo}".strip(), tipo="AGENT", inicio=ts, fin=ts,
-                                    attrs={"input.value": encargo.get("prompt"), "taller.agente": tipo,
-                                           "taller.agent_id": aid}))
-        return s.agentes[aid]
+        if aid not in s.agents:
+            t = self._turn_or_last(s, ts)
+            brief = s.briefs.pop(0) if s.briefs else {}
+            s.agents[aid] = {"trace": t["trace"], "span": _id(8), "parent": t["span"], "start": ts,
+                             "type": ev.get("agent_type") or brief.get("type", ""), "brief": brief.get("prompt", ""),
+                             "in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "model": ""}
+        return s.agents[aid]
 
-    def _padre(self, s: Sesion, sid, ev: dict, ts: int) -> dict:
-        return self._agente(s, sid, ev, ts) if ev.get("agent_id") else self._turno_o_ultimo(s, sid, ts)
+    def _parent(self, s: Session, ev: dict, ts: int) -> dict:
+        return self._agent(s, ev, ts) if ev.get("agent_id") else self._turn_or_last(s, ts)
 
-    def _llamadas(self, s: Sesion, sid, padre: dict, llamadas, ts: int) -> None:
-        """Emite las llamadas al modelo que aún no se habían visto, colgando de `padre` (turno o subagente)."""
-        for ll in llamadas or []:
-            lid = ll.get("id") or ""
-            if lid and lid in s.llm_vistos:
+    def _llm_calls(self, s: Session, sid, parent: dict, calls, ts: int) -> None:
+        """Emits model calls not seen before, as children of `parent` (turn or subagent)."""
+        for c in calls or []:
+            cid = c.get("id") or ""
+            if cid and cid in s.llm_seen:
                 continue
-            if lid:
-                s.llm_vistos.append(lid)
-            fin = min(max(_ts_iso(ll.get("ts", ""), ts), padre["inicio"]), ts)
-            inicio = min(max(s.llm_fin.get(padre["span"], padre["inicio"]), padre["inicio"]), fin)
-            s.llm_fin[padre["span"]] = fin
-            ent, sal = int(ll.get("entrada") or 0), int(ll.get("salida") or 0)
-            padre["ent"] = padre.get("ent", 0) + ent
-            padre["sal"] = padre.get("sal", 0) + sal
-            padre["modelo"] = ll.get("modelo") or padre.get("modelo", "")
-            texto = ll.get("texto") or ("herramientas: " + ", ".join(ll.get("herramientas") or []))
-            self._emitir(self._span(s, sid, trace=padre["trace"], span=_id(8), padre=padre["span"], nombre="modelo",
-                                    tipo="LLM", inicio=inicio, fin=fin, attrs={
-                                        "llm.model_name": ll.get("modelo"), "llm.provider": "anthropic",
-                                        "llm.token_count.prompt": ent, "llm.token_count.completion": sal,
-                                        "llm.token_count.total": ent + sal, "output.value": texto}))
+            if cid:
+                s.llm_seen.append(cid)
+            end = min(max(_ts_iso(c.get("ts", ""), ts), parent["start"]), ts)
+            start = min(max(s.llm_end.get(parent["span"], parent["start"]), parent["start"]), end)
+            s.llm_end[parent["span"]] = end
+            tin, tout = int(c.get("entrada") or 0), int(c.get("salida") or 0)
+            cr, cw = int(c.get("cache_lectura") or 0), int(c.get("cache_escritura") or 0)
+            for k, v in (("in", tin), ("out", tout), ("cache_read", cr), ("cache_write", cw)):
+                parent[k] = parent.get(k, 0) + v
+            model = c.get("modelo") or ""
+            parent["model"] = model or parent.get("model", "")
+            text = c.get("texto") or ("tool calls: " + ", ".join(c.get("herramientas") or []))
+            attrs = {"llm.model_name": model, "llm.provider": "anthropic", "llm.system": "anthropic",
+                     "llm.token_count.prompt": tin, "llm.token_count.completion": tout,
+                     "llm.token_count.total": tin + tout, "output.value": text, "llm.message.id": cid}
+            if cr:
+                attrs["llm.token_count.prompt_details.cache_read"] = cr
+            if cw:
+                attrs["llm.token_count.prompt_details.cache_write"] = cw
+            self._emit(self._span(s, sid, trace=parent["trace"], span=_id(8), parent=parent["span"],
+                                  name=f"LLM call: {model}" if model else "LLM call", kind="LLM",
+                                  start=start, end=end, attrs=attrs))
 
-    def _cerrar_turno(self, s: Sesion, sid, ts: int, ev: dict, llamadas, cierre: str, error=None) -> None:
-        t = s.turno
-        anterior = s.ultimo
-        s.turno = None
-        # Llamadas de un turno anterior que se cerró sin Stop (Ctrl+C, modo -p): se reparten por hora.
-        margen = 2 * S
-        propias, previas = [], []
-        for ll in llamadas or []:
-            h = _ts_iso(ll.get("ts", ""), ts)
-            es_previa = anterior and anterior["inicio"] - margen <= h < t["inicio"] - margen
-            (previas if es_previa else propias).append(ll)
-        if previas:
-            self._llamadas(s, sid, anterior, previas, t["inicio"])
-        self._llamadas(s, sid, t, propias, ts)
-        s.ultimo = {k: t[k] for k in ("trace", "span", "inicio", "prompt", "ent", "sal", "modelo")}
-        respuesta = ev.get("last_assistant_message") or next(
-            (ll.get("texto") for ll in reversed(propias) if ll.get("texto")), "")
-        if cierre == "interrumpido":
-            respuesta = (respuesta + "\n\n" if respuesta else "") + "[turno interrumpido]"
-        self._emitir(self._span(s, sid, trace=t["trace"], span=_id(8), padre=t["span"], nombre="fin del turno",
-                                tipo="CHAIN", inicio=t["inicio"], fin=ts, error=error, attrs={
-                                    "input.value": t.get("prompt"), "output.value": respuesta,
-                                    "llm.model_name": t.get("modelo"), "llm.token_count.prompt": t.get("ent", 0),
-                                    "llm.token_count.completion": t.get("sal", 0),
-                                    "llm.token_count.total": t.get("ent", 0) + t.get("sal", 0),
-                                    "taller.herramientas": t.get("n_tools", 0), "taller.errores": t.get("errores", 0),
-                                    "taller.cierre": cierre, "taller.duracion_s": round((ts - t["inicio"]) / S, 1)}))
+    @staticmethod
+    def _totals(p: dict) -> dict:
+        attrs = {"llm.model_name": p.get("model"), "llm.token_count.prompt": p.get("in", 0),
+                 "llm.token_count.completion": p.get("out", 0),
+                 "llm.token_count.total": p.get("in", 0) + p.get("out", 0)}
+        if p.get("cache_read"):
+            attrs["llm.token_count.prompt_details.cache_read"] = p["cache_read"]
+        if p.get("cache_write"):
+            attrs["llm.token_count.prompt_details.cache_write"] = p["cache_write"]
+        return attrs
 
-    def _sin_resultado(self, s: Sesion, sid, tu: str, h: dict, motivo: str, ts: int) -> None:
-        s.hechas.append(tu)
-        self._emitir(self._span(s, sid, trace=h["trace"], span=_id(8), padre=h["padre"], nombre=h["nombre"],
-                                tipo="TOOL", inicio=h["inicio"], fin=max(ts, h["inicio"]), error=motivo,
-                                attrs={"tool.name": h["nombre"], "input.value": h.get("entrada"),
-                                       "input.mime_type": "application/json", "output.value": motivo,
-                                       "taller.agente": h.get("agente", ""), "taller.sin_resultado": True}))
+    def _close_turn(self, s: Session, sid, ts: int, ev: dict, calls, reason: str, error=None) -> None:
+        t = s.turn
+        previous = s.last
+        s.turn = None
+        # Calls of an earlier turn that closed without Stop (Ctrl+C, -p mode): assigned by time.
+        margin = 2 * S
+        own, earlier = [], []
+        for c in calls or []:
+            h = _ts_iso(c.get("ts", ""), ts)
+            is_earlier = previous and previous["start"] - margin <= h < t["start"] - margin
+            (earlier if is_earlier else own).append(c)
+        if earlier:
+            self._llm_calls(s, sid, previous, earlier, t["start"])
+        self._llm_calls(s, sid, t, own, ts)
+        s.last = {k: t[k] for k in ("trace", "span", "start", "prompt")}
+        answer = ev.get("last_assistant_message") or next((c.get("texto") for c in reversed(own) if c.get("texto")), "")
+        prompt = t.get("prompt", "")
+        notification = prompt.lstrip().startswith(("<task-notification", "<agent-message"))
+        attrs = {"input.value": prompt, "output.value": answer, "llm.model_name": t.get("model"),
+                 "workshop.close_reason": reason, "workshop.tool_count": t.get("tools", 0),
+                 "workshop.tool_errors": t.get("errors", 0), "workshop.subagent_notification": notification}
+        self._emit(self._span(s, sid, trace=t["trace"], span=t["span"], parent=None,
+                              name="Turn (subagent notification)" if notification else "Turn", kind="AGENT",
+                              start=t["start"], end=ts, error=error, attrs=attrs))
 
-    # ---------------------------------------------------------------- entrada
+    def _no_result(self, s: Session, sid, tu: str, h: dict, reason: str, ts: int) -> None:
+        s.done.append(tu)
+        self._emit(self._span(s, sid, trace=h["trace"], span=_id(8), parent=h["parent"], name=h["name"],
+                              kind="TOOL", start=h["start"], end=max(ts, h["start"]), error=reason,
+                              attrs={"tool.name": h["name"], "tool.call.id": tu, "input.value": h.get("input"),
+                                     "input.mime_type": "application/json", "subagent.type": h.get("agent_type"),
+                                     "workshop.no_result": True}))
+
+    # ---------------------------------------------------------------- entry point
 
     def procesar(self, msg: dict, alumno_por_cwd=None) -> tuple[str, list[dict]]:
-        """Procesa un evento del cliente. Devuelve el proyecto de Phoenix y los spans que hay que emitir."""
-        ev = msg.get("evento") or msg  # un hook HTTP manda el evento sin envoltorio
-        sid = ev.get("session_id") or "sin-sesion"
+        """Processes one client event. Returns the Phoenix project and the spans to emit."""
+        ev = msg.get("evento") or msg  # an HTTP hook sends the bare event
+        sid = ev.get("session_id") or "no-session"
         ts = int(msg.get("ts") or time.time_ns())
-        with self.cerrojo:
-            self._salida = []
-            s = self._sesion(sid)
-            alumno = msg.get("alumno") or (alumno_por_cwd(ev.get("cwd")) if alumno_por_cwd else None)
-            cliente = msg.get("cliente") or {}
+        with self.lock:
+            self._out = []
+            s = self._session(sid)
+            student = msg.get("alumno") or (alumno_por_cwd(ev.get("cwd")) if alumno_por_cwd else None)
+            client = msg.get("cliente") or {}
             s.meta.update({k: v for k, v in {
-                "alumno": alumno or s.meta.get("alumno") or "sin-nombre-" + sid[:8],
-                "proyecto": msg.get("proyecto") or s.meta.get("proyecto") or "taller",
-                "taller.cwd": ev.get("cwd"), "taller.proyecto_local": carpeta(ev.get("cwd")),
-                "taller.so": cliente.get("so"),
-                "taller.cliente": cliente.get("version") or ("hook-http" if "evento" not in msg else None),
+                "student": student or s.meta.get("student") or "unnamed-" + sid[:8],
+                "project": msg.get("proyecto") or s.meta.get("project") or "taller",
+                "workshop.cwd": ev.get("cwd"), "workshop.folder": folder(ev.get("cwd")),
+                "workshop.os": client.get("so"),
+                "workshop.client": client.get("version") or ("http-hooks" if "evento" not in msg else None),
             }.items() if v})
-            self._evento(s, sid, ev, ts, msg)
-            self._caducadas(s, sid, ts)
-            self._guardar(sid)
-            return s.meta.get("proyecto", "taller"), self._salida
+            self._event(s, sid, ev, ts, msg)
+            self._expired(s, sid, ts)
+            self._save(sid)
+            return s.meta.get("project", "taller"), self._out
 
-    def _evento(self, s: Sesion, sid, ev: dict, ts: int, msg: dict) -> None:
+    def _event(self, s: Session, sid, ev: dict, ts: int, msg: dict) -> None:
         n = ev.get("hook_event_name", "")
         if n == "SessionStart":
-            self._emitir(self._span(s, sid, trace=_id(16), span=_id(8), padre=None, nombre="inicio de sesión",
-                                    tipo="CHAIN", inicio=ts, fin=ts,
-                                    attrs={"input.value": ev.get("source"), "llm.model_name": ev.get("model")}))
+            s.meta["workshop.session_source"] = ev.get("source", "")
         elif n == "UserPromptSubmit":
-            if s.turno:
-                self._cerrar_turno(s, sid, ts, {}, [], "interrumpido")
-            self._abrir_turno(s, sid, ts, ev.get("prompt", ""))
+            # The client sends the previous turn's model calls again: those Stop did not see yet.
+            if s.turn:
+                self._close_turn(s, sid, ts, {}, msg.get("llamadas"), "interrupted")
+            elif s.last and msg.get("llamadas"):
+                self._llm_calls(s, sid, s.last, msg["llamadas"], ts)
+            self._open_turn(s, ts, ev.get("prompt", ""))
         elif n == "PreToolUse":
             tu = ev.get("tool_use_id") or _id(8)
             if ev.get("tool_name") == "Agent" and not ev.get("agent_id"):
                 ti = ev.get("tool_input") or {}
-                s.encargos.append({"prompt": _texto(ti.get("prompt") or ti), "tipo": ti.get("subagent_type", "")})
-            if tu not in s.hechas:
-                p = self._padre(s, sid, ev, ts)
-                s.herr[tu] = {"inicio": ts, "nombre": ev.get("tool_name", "herramienta"), "trace": p["trace"],
-                              "padre": p["span"], "entrada": _texto(ev.get("tool_input")),
-                              "agente": ev.get("agent_type", "")}
-                # Marca de inicio: una herramienta larga (un Bash de una hora) se ve desde que empieza.
-                # Phoenix no actualiza spans, así que el resultado llegará después en otro span.
-                h = s.herr[tu]
-                self._emitir(self._span(s, sid, trace=h["trace"], span=_id(8), padre=h["padre"],
-                                        nombre=f"empieza {h['nombre']}", tipo="CHAIN", inicio=ts, fin=ts, attrs={
-                                            "tool.name": h["nombre"], "input.value": h["entrada"],
-                                            "input.mime_type": "application/json", "taller.agente": h["agente"],
-                                            "taller.tool_use_id": tu}))
+                s.briefs.append({"prompt": _text(ti.get("prompt") or ti), "type": ti.get("subagent_type", "")})
+            if tu not in s.done:
+                p = self._parent(s, ev, ts)
+                h = {"start": ts, "name": ev.get("tool_name", "tool"), "trace": p["trace"], "parent": p["span"],
+                     "input": _text(ev.get("tool_input")), "agent_type": ev.get("agent_type", "")}
+                s.tools[tu] = h
+                self._emit(self._span(s, sid, trace=h["trace"], span=_id(8), parent=h["parent"],
+                                      name=f"Tool started: {h['name']}", kind="CHAIN", start=ts, end=ts, attrs={
+                                          "tool.name": h["name"], "tool.call.id": tu, "input.value": h["input"],
+                                          "input.mime_type": "application/json", "subagent.type": h["agent_type"]}))
         elif n in ("PostToolUse", "PostToolUseFailure"):
-            p = self._padre(s, sid, ev, ts)
-            self._llamadas(s, sid, p, msg.get("llamadas"), ts)
+            p = self._parent(s, ev, ts)
+            self._llm_calls(s, sid, p, msg.get("llamadas"), ts)
             tu = ev.get("tool_use_id", "")
-            h = s.herr.pop(tu, None) or {"inicio": ts - int(ev.get("duration_ms") or 0) * 1_000_000,
-                                          "trace": p["trace"], "padre": p["span"]}
-            error = (ev.get("error") or "fallo") if n == "PostToolUseFailure" else None
-            t = s.turno or s.ultimo
+            h = s.tools.pop(tu, None) or {"start": ts - int(ev.get("duration_ms") or 0) * 1_000_000,
+                                          "trace": p["trace"], "parent": p["span"]}
+            error = (ev.get("error") or "failed") if n == "PostToolUseFailure" else None
+            t = s.turn or s.last
             if t is not None:
-                t["n_tools"] = t.get("n_tools", 0) + 1
-                t["errores"] = t.get("errores", 0) + (1 if error else 0)
+                t["tools"] = t.get("tools", 0) + 1
+                t["errors"] = t.get("errors", 0) + (1 if error else 0)
             if tu:
-                s.hechas.append(tu)
-            herramienta = ev.get("tool_name", "herramienta")
-            self._emitir(self._span(s, sid, trace=h["trace"], span=_id(8), padre=h["padre"], nombre=herramienta,
-                                    tipo="TOOL", inicio=h["inicio"], fin=ts, error=error, attrs={
-                                        "tool.name": herramienta, "input.value": _texto(ev.get("tool_input")),
-                                        "input.mime_type": "application/json",
-                                        "output.value": _texto(ev.get("tool_response") if error is None else error),
-                                        "taller.agente": ev.get("agent_type", ""),
-                                        "taller.interrupcion": bool(ev.get("is_interrupt"))}))
+                s.done.append(tu)
+            tool = ev.get("tool_name", "tool")
+            kind = "TOOL"
+            attrs = {"tool.name": tool, "tool.call.id": tu, "input.value": _text(ev.get("tool_input")),
+                     "input.mime_type": "application/json", "subagent.type": ev.get("agent_type"),
+                     "subagent.id": ev.get("agent_id"), "workshop.interrupted": bool(ev.get("is_interrupt"))}
+            if error is None:
+                attrs["output.value"] = _text(ev.get("tool_response"))
+            self._emit(self._span(s, sid, trace=h["trace"], span=_id(8), parent=h["parent"], name=tool, kind=kind,
+                                  start=h["start"], end=ts, error=error, attrs=attrs))
         elif n == "PermissionDenied":
             tu = ev.get("tool_use_id") or _id(8)
-            h = s.herr.pop(tu, None)
+            h = s.tools.pop(tu, None)
             if h is None:
-                p = self._padre(s, sid, ev, ts)
-                h = {"inicio": ts, "nombre": ev.get("tool_name", "herramienta"), "trace": p["trace"],
-                     "padre": p["span"], "entrada": _texto(ev.get("tool_input")), "agente": ev.get("agent_type", "")}
-            self._sin_resultado(s, sid, tu, h, "denegada: " + _texto(
-                ev.get("reason") or ev.get("message") or "permiso denegado"), ts)
+                p = self._parent(s, ev, ts)
+                h = {"start": ts, "name": ev.get("tool_name", "tool"), "trace": p["trace"], "parent": p["span"],
+                     "input": _text(ev.get("tool_input")), "agent_type": ev.get("agent_type", "")}
+            self._no_result(s, sid, tu, h, "permission denied: " + _text(
+                ev.get("reason") or ev.get("message") or "denied"), ts)
         elif n == "SubagentStart":
             if ev.get("agent_id"):
-                self._agente(s, sid, ev, ts)
+                self._agent(s, ev, ts)
         elif n == "SubagentStop":
             ev = {**ev, "agent_id": ev.get("agent_id") or _id(8)}
-            ag = self._agente(s, sid, ev, ts)
-            self._llamadas(s, sid, ag, msg.get("llamadas"), ts)
-            s.agentes.pop(ev["agent_id"], None)
-            respuesta = ev.get("last_assistant_message") or next(
-                (ll.get("texto") for ll in reversed(msg.get("llamadas") or []) if ll.get("texto")), "")
-            self._emitir(self._span(s, sid, trace=ag["trace"], span=_id(8), padre=ag["span"], nombre="fin del subagente",
-                                    tipo="CHAIN", inicio=ag["inicio"], fin=ts, attrs={
-                                        "output.value": respuesta, "llm.model_name": ag.get("modelo"),
-                                        "llm.token_count.prompt": ag.get("ent", 0),
-                                        "llm.token_count.completion": ag.get("sal", 0),
-                                        "llm.token_count.total": ag.get("ent", 0) + ag.get("sal", 0),
-                                        "taller.agente": ag.get("tipo"),
-                                        "taller.duracion_s": round((ts - ag["inicio"]) / S, 1)}))
+            ag = self._agent(s, ev, ts)
+            self._llm_calls(s, sid, ag, msg.get("llamadas"), ts)
+            s.agents.pop(ev["agent_id"], None)
+            answer = ev.get("last_assistant_message") or next(
+                (c.get("texto") for c in reversed(msg.get("llamadas") or []) if c.get("texto")), "")
+            kind_name = ag.get("type") or ev.get("agent_type") or "unknown"
+            self._emit(self._span(s, sid, trace=ag["trace"], span=ag["span"], parent=ag["parent"],
+                                  name=f"Subagent: {kind_name}", kind="AGENT", start=ag["start"], end=ts, attrs={
+                                      "input.value": ag.get("brief"), "output.value": answer,
+                                      "llm.model_name": ag.get("model"),
+                                      "subagent.id": ev["agent_id"], "subagent.type": kind_name}))
         elif n == "PreCompact":
-            self._emitir(self._span(s, sid, trace=_id(16), span=_id(8), padre=None, nombre="compactación de contexto",
-                                    tipo="CHAIN", inicio=ts, fin=ts, attrs={"input.value": ev.get("trigger")}))
+            t = self._turn_or_last(s, ts)
+            self._emit(self._span(s, sid, trace=t["trace"], span=_id(8), parent=t["span"], name="Context compaction",
+                                  kind="CHAIN", start=ts, end=ts, attrs={"input.value": ev.get("trigger")}))
         elif n in ("Stop", "StopFailure"):
-            if not s.turno:
-                self._abrir_turno(s, sid, ts)
-            error = _texto(ev.get("error") or ev.get("reason") or "error de la API") if n == "StopFailure" else None
-            self._cerrar_turno(s, sid, ts, ev, msg.get("llamadas"), "error" if error else "normal", error)
+            if not s.turn:
+                self._open_turn(s, ts)
+            error = _text(ev.get("error") or ev.get("reason") or "API error") if n == "StopFailure" else None
+            self._close_turn(s, sid, ts, ev, msg.get("llamadas"), "error" if error else "stop", error)
         elif n == "SessionEnd":
-            if s.turno:
-                self._cerrar_turno(s, sid, ts, ev, msg.get("llamadas"), "fin de sesión")
-            self._emitir(self._span(s, sid, trace=_id(16), span=_id(8), padre=None, nombre="fin de sesión",
-                                    tipo="CHAIN", inicio=ts, fin=ts, attrs={"input.value": ev.get("reason")}))
+            if s.turn:
+                self._close_turn(s, sid, ts, ev, msg.get("llamadas"), "session_end")
+            elif s.last and msg.get("llamadas"):
+                self._llm_calls(s, sid, s.last, msg["llamadas"], ts)
 
-    def _caducadas(self, s: Sesion, sid, ts: int) -> None:
-        for tu, h in list(s.herr.items()):
-            if ts - h["inicio"] > GRACIA * S:
-                s.herr.pop(tu)
-                self._sin_resultado(s, sid, tu, h, "sin resultado: denegada o interrumpida", ts)
+    def _expired(self, s: Session, sid, ts: int) -> None:
+        for tu, h in list(s.tools.items()):
+            if ts - h["start"] > GRACE * S:
+                s.tools.pop(tu)
+                self._no_result(s, sid, tu, h, "no result: denied or interrupted", ts)
 
     def barrer(self) -> list[tuple[str, list[dict]]]:
-        """Revisa todas las sesiones en memoria (lo llama un hilo del receptor cada pocos segundos)."""
-        salida = []
+        """Checks every session in memory (called by a receiver thread every few seconds)."""
+        result = []
         ts = time.time_ns()
-        with self.cerrojo:
-            for sid, s in self.sesiones.items():
-                self._salida = []
-                self._caducadas(s, sid, ts)
-                if self._salida:
-                    self._guardar(sid)
-                    salida.append((s.meta.get("proyecto", "taller"), self._salida))
-            self._salida = []
-        return salida
+        with self.lock:
+            for sid, s in self.sessions.items():
+                self._out = []
+                self._expired(s, sid, ts)
+                if self._out:
+                    self._save(sid)
+                    result.append((s.meta.get("project", "taller"), self._out))
+            self._out = []
+        return result
 
 
-def lote(proyecto: str, spans: list[dict]) -> dict:
+def lote(project: str, spans: list[dict]) -> dict:
     return {"resourceSpans": [{
-        "resource": {"attributes": [_atributo("openinference.project.name", proyecto),
-                                    _atributo("service.name", "claude-code")]},
-        "scopeSpans": [{"scope": {"name": "taller-monitor-receptor", "version": "2.1.0"}, "spans": spans}],
+        "resource": {"attributes": [_attribute("openinference.project.name", project),
+                                    _attribute("service.name", "claude-code")]},
+        "scopeSpans": [{"scope": {"name": "taller-monitor-receiver", "version": "3.0.0"}, "spans": spans}],
     }]}
