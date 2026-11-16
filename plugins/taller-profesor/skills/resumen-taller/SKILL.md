@@ -14,10 +14,12 @@ Cada alumno es un `user.id`. Cada sesión de Claude Code es un `session.id`. Spa
 
 | Span | Tipo | Qué contiene |
 |---|---|---|
-| `turno` | AGENT, raíz de la traza | `input.value`: el prompt del alumno. `output.value`: la respuesta final. `taller.herramientas`, `taller.errores`, `taller.cierre` (normal, interrumpido, fin de sesión), tokens |
+| `turno` | AGENT, raíz de la traza | `input.value`: el prompt del alumno. `output.value`: la respuesta final. `taller.herramientas`, `taller.errores`, `taller.cierre` (normal, interrumpido, error, fin de sesión), tokens |
 | `modelo` | LLM, hijo de `turno` | Cada llamada al modelo: modelo, tokens y texto |
 | `Bash`, `Edit`, `Read`... | TOOL, hijo de `turno` | `input.value`: argumentos en JSON. `output.value`: resultado. Estado de error si la herramienta falló |
-| `subagente <tipo>` | AGENT | Resultado de un subagente |
+| `subagente <tipo>` | AGENT | Un subagente: su respuesta final y, colgando de él, sus llamadas al modelo y sus herramientas |
+| `aviso de subagente` | AGENT, raíz | Turno que abre Claude Code cuando termina un subagente en segundo plano |
+| Herramienta en rojo con `taller.sin_resultado` | TOOL | Empezó y no terminó (denegada o interrumpida), o se denegó el permiso |
 | `inicio de sesión`, `fin de sesión`, `compactación de contexto` | CHAIN | Marcas de la sesión |
 
 `taller.proyecto_local` es la carpeta en la que trabaja el alumno. El proyecto de Phoenix por defecto es `taller`.

@@ -24,6 +24,8 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import threading
+
 from google.protobuf import json_format
 from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
 
@@ -31,6 +33,13 @@ TOKEN = os.environ.get("TALLER_MONITOR_TOKEN", "")
 PUERTO = int(os.environ.get("RECEPTOR_PUERTO", "6010"))
 PHOENIX = os.environ.get("PHOENIX_URL", "http://127.0.0.1:6006").rstrip("/")
 MAX_CUERPO = 10 * 1024 * 1024
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+import trazas  # noqa: E402
+
+RECONSTRUCTOR = trazas.Reconstructor(os.path.join(DATA, "sesiones"))
+PENDIENTES: list[bytes] = []  # lotes que Phoenix no aceptó; se reintentan desde el hilo de barrido
+PENDIENTES_LOCK = threading.Lock()
 
 
 def hex_a_b64(v: str) -> str:
@@ -130,6 +139,46 @@ def guardar_jsonl(nombre: str, datos: dict) -> None:
         f.write(json.dumps(datos, ensure_ascii=False) + "\n")
 
 
+def a_phoenix(pb: bytes) -> bool:
+    try:
+        req = urllib.request.Request(PHOENIX + "/v1/traces", data=pb, method="POST",
+                                     headers={"Content-Type": "application/x-protobuf"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status < 300
+    except Exception as e:
+        log("Phoenix no responde:", str(e)[:200])
+        return False
+
+
+def emitir(proyecto: str, spans: list[dict]) -> None:
+    """Manda spans reconstruidos a Phoenix; si no responde, quedan pendientes para el hilo de barrido."""
+    if not spans:
+        return
+    pb, _, _ = a_protobuf(trazas.lote(proyecto, spans))
+    if not a_phoenix(pb):
+        with PENDIENTES_LOCK:
+            if len(PENDIENTES) < 10_000:
+                PENDIENTES.append(pb)
+
+
+def barrido() -> None:
+    """Cada 15 s: herramientas sin resultado y reintentos a Phoenix."""
+    while True:
+        time.sleep(15)
+        try:
+            for proyecto, spans in RECONSTRUCTOR.barrer():
+                emitir(proyecto, spans)
+            with PENDIENTES_LOCK:
+                lotes, PENDIENTES[:] = list(PENDIENTES), []
+            for i, pb in enumerate(lotes):
+                if not a_phoenix(pb):
+                    with PENDIENTES_LOCK:
+                        PENDIENTES.extend(lotes[i:])
+                    break
+        except Exception as e:
+            log("barrido:", type(e).__name__, str(e)[:200])
+
+
 def log(*partes) -> None:
     print(time.strftime("%H:%M:%S"), *partes, flush=True)
 
@@ -156,7 +205,7 @@ class Manejador(BaseHTTPRequestHandler):
 
     def do_POST(self):
         origen = self.headers.get("X-Forwarded-For", self.client_address[0])
-        if self.path not in ("/v1/traces", "/v1/logs", "/v1/metrics"):
+        if self.path not in ("/v1/traces", "/v1/logs", "/v1/metrics", "/v1/events"):
             return self.responder(404, "no encontrado")
         auth = self.headers.get("Authorization", "")
         if not TOKEN or not hmac.compare_digest(auth.encode(), f"Bearer {TOKEN}".encode()):
@@ -165,6 +214,20 @@ class Manejador(BaseHTTPRequestHandler):
         largo = int(self.headers.get("Content-Length", "0") or 0)
         if largo <= 0 or largo > MAX_CUERPO:
             return self.responder(413, "cuerpo vacío o demasiado grande")
+        if self.path == "/v1/events":
+            # Eventos de hooks (plugin o hook HTTP): el receptor monta las trazas.
+            try:
+                msg = json.loads(self.rfile.read(largo))
+                if "evento" not in msg and self.headers.get("X-Alumno"):
+                    msg = {"alumno": self.headers["X-Alumno"], "proyecto": self.headers.get("X-Proyecto"), "evento": msg}
+                proyecto, spans = RECONSTRUCTOR.procesar(msg)
+            except Exception as e:
+                log("400", origen, "/v1/events", type(e).__name__, str(e)[:200])
+                return self.responder(400, "evento no válido")
+            ev = msg.get("evento") or msg
+            emitir(proyecto, spans)
+            log(200, msg.get("alumno") or "?", ev.get("hook_event_name", "?"), f"{len(spans)} spans", origen)
+            return self.responder(200, "")
         if self.path in ("/v1/logs", "/v1/metrics"):
             # Telemetría nativa: eventos y métricas se guardan tal cual para consultarlos después.
             try:
@@ -182,24 +245,17 @@ class Manejador(BaseHTTPRequestHandler):
         except Exception as e:
             log("400", origen, type(e).__name__, str(e)[:200])
             return self.responder(400, "OTLP JSON no válido")
-        try:
-            req = urllib.request.Request(
-                PHOENIX + "/v1/traces", data=pb, method="POST",
-                headers={"Content-Type": "application/x-protobuf"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                codigo = r.status
-        except Exception as e:
-            log("502", origen, "Phoenix no responde:", str(e)[:200])
+        if not a_phoenix(pb):
             return self.responder(502, "Phoenix no disponible")
-        log(codigo, ",".join(sorted(alumnos)) or "?", f"{n} spans", origen)
-        self.responder(200 if codigo < 300 else 502, "ok")
+        log(200, ",".join(sorted(alumnos)) or "?", f"{n} spans", origen)
+        self.responder(200, "ok")
 
 
 def main() -> int:
     if not TOKEN:
         print("Falta TALLER_MONITOR_TOKEN", file=sys.stderr)
         return 1
+    threading.Thread(target=barrido, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PUERTO), Manejador)
     log(f"receptor en http://127.0.0.1:{PUERTO} -> {PHOENIX}")
     srv.serve_forever()
