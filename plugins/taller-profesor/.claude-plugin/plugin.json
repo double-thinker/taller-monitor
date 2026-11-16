@@ -1,0 +1,16 @@
+{
+  "name": "taller-profesor",
+  "displayName": "Taller: panel del profesor",
+  "version": "1.0.0",
+  "description": "Para el profesor: conecta Claude Code al Phoenix local y añade la skill resumen-taller para revisar qué hace cada alumno.",
+  "author": {
+    "name": "Mindmakers"
+  },
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "phoenix": {
+      "type": "http",
+      "url": "http://127.0.0.1:6006/mcp"
+    }
+  }
+}

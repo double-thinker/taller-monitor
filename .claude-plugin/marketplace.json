@@ -1,0 +1,21 @@
+{
+  "name": "taller-monitor",
+  "owner": {
+    "name": "Mindmakers"
+  },
+  "metadata": {
+    "description": "Monitorización de sesiones de Claude Code durante un taller"
+  },
+  "plugins": [
+    {
+      "name": "taller-monitor",
+      "source": "./plugins/taller-monitor",
+      "description": "Para los alumnos: envía la actividad de la sesión al profesor"
+    },
+    {
+      "name": "taller-profesor",
+      "source": "./plugins/taller-profesor",
+      "description": "Para el profesor: MCP de Phoenix y skill de resumen"
+    }
+  ]
+}
